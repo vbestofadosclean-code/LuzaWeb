@@ -1,0 +1,34 @@
+[build]
+  publish = "public"
+  command = "npm test"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  included_files = ["schema.sql", "schema.sqlite.sql"]
+
+[functions."server"]
+  external_node_modules = ["express", "cookie-parser", "bcryptjs", "jsonwebtoken", "pg", "serverless-http"]
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/server/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/v1/*"
+  to = "/.netlify/functions/server/v1/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/sites/*"
+  to = "/.netlify/functions/server/sites/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
