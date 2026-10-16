@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#07100d">
+  <meta name="description" content="LUZAWEB — cria, publica e liga sites a dados reais.">
+  <title>LUZAWEB — Versão 1 · Cria. Publica. Liga.</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="toast" class="toast" role="status"></div>
+
+  <section id="landingView" class="landing-view">
+    <div class="landing-glow"></div>
+    <nav class="landing-nav">
+      <div class="brand brand-lg"><span class="brand-mark">L</span><span>LUZAWEB</span><small>PLATFORM</small></div>
+      <div class="landing-nav-actions"><button id="landingLogin" class="btn ghost">Entrar</button><button id="landingCreate" class="btn primary">Criar conta</button></div>
+    </nav>
+    <main class="landing-main">
+      <div class="hero-copy">
+        <div class="hero-label">DESENVOLVIMENTO WEB</div>
+        <h1>Cria.<br><em>Publica.</em><br>Liga.</h1>
+        <p>O LUZAWEB junta projetos, editor, deploy real, base de dados persistente e API num único workspace.</p>
+        <div class="hero-actions"><button class="btn primary hero-btn" id="landingCreateHero">Começar agora</button></div>
+        <div class="hero-pills"><span>Repository</span><span>Deploy</span><span>Database</span><span>API</span></div>
+      </div>
+      <div class="landing-visual">
+        <div class="visual-window"><div class="visual-top"><span></span><span></span><span></span><b>LUZAWEB</b></div><div class="visual-body"><div class="visual-sidebar"><div class="visual-logo">L</div><i></i><i></i><i></i><i></i></div><div class="visual-content"><div class="visual-line short"></div><div class="visual-line"></div><div class="visual-line long"></div><div class="visual-cards"><div></div><div></div><div></div></div><div class="visual-status"><span></span> Site online · Database ligado · API pronta</div></div></div></div>
+      </div>
+    </main>
+    <section id="landingExplorePanel" class="landing-features">
+      <div><b>01</b><strong>Vários projetos</strong><span>Cada site vive no seu próprio projeto e URL.</span></div>
+      <div><b>02</b><strong>Deploy</strong><span>Publica versões e abre o endereço online.</span></div>
+      <div><b>03</b><strong>Base de Dados</strong><span>Cria tabelas e registos persistentes no PostgreSQL.</span></div>
+      <div><b>04</b><strong>API do projeto</strong><span>Gera chaves e integra as tabelas por HTTP.</span></div>
+    </section>
+  </section>
+
+  <section id="authView" class="auth-view hidden">
+    <div class="auth-noise"></div>
+    <div class="auth-copy"><div class="brand brand-lg"><span class="brand-mark">L</span><span>LUZAWEB</span><small>PLATFORM</small></div><h1>O teu código.<br><em>O teu site.</em><br>O teu espaço.</h1><p>Cria a conta uma vez e depois trabalha com projetos, deploy, bases de dados e APIs reais.</p><div class="hero-pills"><span>HTML</span><span>CSS</span><span>JavaScript</span><span>PostgreSQL</span></div></div>
+    <div class="auth-panel"><div class="auth-card"><div class="auth-tabs"><button class="auth-tab active" data-auth="login">Entrar</button><button class="auth-tab" data-auth="register">Criar conta</button></div><div id="authFormWrap"></div></div></div>
+  </section>
+
+  <section id="appView" class="app-view hidden">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top"><div class="brand"><span class="brand-mark">L</span><span>LUZAWEB</span></div><button id="sidebarToggle" class="icon-btn mobile-only" aria-label="Abrir menu">☰</button></div>
+      <nav class="main-nav">
+        <button class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span> Dashboard</button>
+        <button class="nav-item" data-view="projects"><span class="nav-icon">◇</span> Projetos</button>
+        <button class="nav-item" data-view="activity"><span class="nav-icon">◌</span> Atividade</button>
+        <div class="nav-divider"></div>
+        <button class="nav-item" data-view="editor"><span class="nav-icon">▣</span> Editor</button>
+        <button class="nav-item" data-view="trash"><span class="nav-icon">⌫</span> Lixeira</button>
+        <button class="nav-item" data-view="account"><span class="nav-icon">◎</span> Conta</button>
+      </nav>
+      <div class="sidebar-bottom"><div class="sidebar-info"><span class="status-dot"></span> LUZAWEB online</div><button id="logoutBtn" class="nav-item logout"><span class="nav-icon">↪</span> Sair</button></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><div class="crumb" id="crumb">Dashboard</div><h2 id="pageTitle">Os teus projetos</h2></div><div class="topbar-actions"><button id="globalNewBtn" class="btn primary"><span>＋</span> Novo projeto</button><div class="user-mini"><span id="userAvatar" class="avatar">L</span><span id="userName">Utilizador</span></div></div></header>
+      <section id="dashboardView" class="page-view"></section>
+      <section id="projectsView" class="page-view hidden"></section>
+      <section id="activityView" class="page-view hidden"></section>
+      <section id="editorView" class="page-view hidden"></section>
+      <section id="trashView" class="page-view hidden"></section>
+      <section id="accountView" class="page-view hidden"></section>
+      <section id="projectView" class="page-view hidden"></section>
+    </main>
+  </section>
+
+  <dialog id="projectDialog" class="dialog"><form id="projectForm" class="dialog-card"><button type="button" class="dialog-close" data-close-dialog>×</button><div class="dialog-kicker">NOVO PROJETO</div><h3>Começa um site novo</h3><p class="muted">Cria um projeto com <strong>index.html</strong>, <strong>style.css</strong> e <strong>script.js</strong>.</p><label>Nome do projeto<input id="projectName" required maxlength="60" placeholder="Ex.: portfólio"></label><label>Descrição<textarea id="projectDescription" maxlength="180" placeholder="Uma frase curta sobre o projeto"></textarea></label><div class="dialog-actions"><button type="button" class="btn secondary" data-close-dialog>Cancelar</button><button type="submit" class="btn primary">Criar projeto</button></div></form></dialog>
+  <dialog id="fileDialog" class="dialog"><form id="fileForm" class="dialog-card"><button type="button" class="dialog-close" data-close-dialog>×</button><div class="dialog-kicker">NOVO FICHEIRO</div><h3>Adicionar ficheiro</h3><label>Nome do ficheiro<input id="fileName" required maxlength="180" placeholder="ex.: about.html"></label><label>Conteúdo<textarea id="fileContent" class="big-textarea" spellcheck="false" placeholder="Escreve ou cola o código aqui"></textarea></label><div class="dialog-actions"><button type="button" class="btn secondary" data-close-dialog>Cancelar</button><button type="submit" class="btn primary">Adicionar</button></div></form></dialog>
+  <script src="app.js" defer></script>
+</body>
+</html>
