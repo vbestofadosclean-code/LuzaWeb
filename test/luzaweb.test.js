@@ -334,3 +334,10 @@ test('Neon provisioning uses server-side API credentials and routes table operat
   assert.match(server, /projectPhysicalTableRefFor\(req\.apiProject\.id, table\.name, store\.external\)/);
   assert.match(server, /insertPhysicalRecord\(store\.executor, req\.apiProject\.id, table, data, \{ external: store\.external \}\)/);
 });
+
+test('Netlify PostgreSQL deployment does not statically bundle the local SQLite adapter', async () => {
+  const server = await read('server.js');
+  assert.doesNotMatch(server, /import\s+\{\s*SQLitePool\s*\}\s+from\s+['"]\.\/local-db\.js['"]/);
+  assert.match(server, /const localDbModulePath = ['"]\.\/local-db\.js['"];\s*const \{ SQLitePool \} = await import\(localDbModulePath\)/);
+  assert.match(server, /if \(!pool\) \{/);
+});

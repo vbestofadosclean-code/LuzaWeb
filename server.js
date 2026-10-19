@@ -7,7 +7,6 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
-import { SQLitePool } from './local-db.js';
 
 const { Pool, Client } = pg;
 const __filename = fileURLToPath(import.meta.url);
@@ -19,7 +18,10 @@ const COOKIE_NAME = 'luzaweb_token';
 const databaseConfigured = Boolean(process.env.DATABASE_URL);
 const localDatabasePath = path.join(__dirname, '.data', 'luzaweb.sqlite');
 
-const pool = databaseConfigured
+// Production uses PostgreSQL. Load the local SQLite adapter lazily only for
+// local development, so Netlify's function bundler never tries to package the
+// node:sqlite built-in into the production function.
+let pool = databaseConfigured
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: process.env.DB_SSL_REJECT_UNAUTHORIZED === 'false' ? { rejectUnauthorized: false } : undefined,
@@ -27,7 +29,7 @@ const pool = databaseConfigured
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000
     })
-  : new SQLitePool(localDatabasePath);
+  : null;
 
 // Separate Neon pools keep each project's data in its own real PostgreSQL database.
 const projectDataPools = new Map();
@@ -543,6 +545,13 @@ function initDb() {
     }
     if (process.env.NETLIFY && (JWT_SECRET === 'dev-only-change-me' || Buffer.byteLength(JWT_SECRET, 'utf8') < 32 || /replace-with|change-me|your-secret|dev-only/i.test(JWT_SECRET))) {
       throw new Error('JWT_SECRET é obrigatória no Netlify, deve ter pelo menos 32 bytes e não pode ser um valor de exemplo. Mantém o mesmo segredo entre publicações.');
+    }
+    if (!pool) {
+      // This variable-based dynamic import is intentionally not statically
+      // bundled into Netlify's PostgreSQL-only production function.
+      const localDbModulePath = './local-db.js';
+      const { SQLitePool } = await import(localDbModulePath);
+      pool = new SQLitePool(localDatabasePath);
     }
     const schemaFile = databaseConfigured ? 'schema.sql' : 'schema.sqlite.sql';
     const schema = await readSchemaFile(schemaFile);
