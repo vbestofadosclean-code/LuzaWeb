@@ -5,12 +5,13 @@ import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import crypto from 'crypto';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
 
 const { Pool, Client } = pg;
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Use the deployed project root instead of import.meta.url. Netlify's esbuild
+// function bundle may emit CommonJS, where import.meta.url is unavailable.
+const __dirname = path.resolve(process.cwd());
+const __filename = path.join(__dirname, 'server.js');
 const PORT = Number(process.env.PORT || 10000);
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
 const COOKIE_NAME = 'luzaweb_token';

@@ -341,3 +341,10 @@ test('Netlify PostgreSQL deployment does not statically bundle the local SQLite 
   assert.match(server, /const localDbModulePath = ['"]\.\/local-db\.js['"];\s*const \{ SQLitePool \} = await import\(localDbModulePath\)/);
   assert.match(server, /if \(!pool\) \{/);
 });
+
+
+test('server path resolution works with Netlify CommonJS function bundles', async () => {
+  const server = await read('server.js');
+  assert.doesNotMatch(server, /fileURLToPath\(import\.meta\.url\)/);
+  assert.match(server, /const __dirname = path\.resolve\(process\.cwd\(\)\)/);
+});

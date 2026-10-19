@@ -116,3 +116,8 @@ A secção **Database** tem uma página dedicada à criação de uma base Postgr
 A secção **Variáveis do ambiente** permite criar, editar, eliminar e agrupar variáveis por projecto. Os valores secretos são cifrados no backend e não são devolvidos ao browser; ao editar uma variável secreta, deixa o campo de valor vazio para manter o segredo actual. No modo local de browser, os dados ficam no armazenamento local do navegador e não têm a mesma protecção do backend.
 
 No Deploy estático, as variáveis não secretas são disponibilizadas ao HTML publicado através de `window.LUZA_ENV`; valores marcados como secretos nunca são enviados ao navegador. Nomes reconhecidos como credenciais (por exemplo, `DATABASE_URL`, `JWT_SECRET`, `PASSWORD`, `TOKEN`, `API_KEY` e chaves privadas) são forçados a secretos, mesmo que alguém tente desmarcar essa opção. Ainda não há runtime para executar código de backend arbitrário criado por utilizadores nem para injectar segredos nesses servidores.
+
+
+### Correção adicional de publicação (Netlify)
+
+A resolução dos caminhos no servidor usa agora `process.cwd()` em vez de `import.meta.url`, para evitar falha quando o bundler do Netlify empacota o módulo em formato CommonJS. Se o repositório já tinha sido atualizado pelo browser, substitui também o ficheiro da raiz `server.js` por esta versão e faz commit; depois aguarda o novo deploy. Não é necessário alterar as variáveis de ambiente para corrigir este erro de caminho.
