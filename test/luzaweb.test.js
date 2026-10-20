@@ -288,7 +288,7 @@ test('LUZAWEB is identified as Version 1 and README documents the real Neon setu
   const html = await read('public/index.html');
   const readme = await read('README.md');
   const env = await read('.env.example');
-  assert.equal(pkg.version, '1.0.0');
+  assert.equal(pkg.version, '1.0.1');
   assert.match(html, /LUZAWEB — Versão 1/);
   assert.match(readme, /LUZAWEB — Versão 1/);
   for (const key of ['DATABASE_URL', 'JWT_SECRET', 'NEON_API_KEY']) {
@@ -347,4 +347,24 @@ test('server path resolution works with Netlify CommonJS function bundles', asyn
   const server = await read('server.js');
   assert.doesNotMatch(server, /fileURLToPath\(import\.meta\.url\)/);
   assert.match(server, /const __dirname = path\.resolve\(process\.cwd\(\)\)/);
+});
+
+
+test('register form explicitly sends validated, form-scoped JSON fields and bypasses stale asset cache', async () => {
+  const appJs = await read('public/app.js');
+  const html = await read('public/index.html');
+  assert.match(appJs, /const form = e\.currentTarget;/);
+  assert.match(appJs, /const payload = \{ name, email, password \};/);
+  assert.match(appJs, /headers: \{ 'Content-Type': 'application\/json' \}/);
+  assert.match(appJs, /cache: 'no-store'/);
+  assert.match(html, /app\.js\?v=1\.0\.2/);
+});
+
+test('register API returns field-specific safe diagnostics without echoing credentials', async () => {
+  const server = await read('server.js');
+  assert.match(server, /AUTH_REGISTER_INVALID_FIELDS/);
+  assert.match(server, /bodyKeys: Object\.keys\(body\)/);
+  assert.match(server, /emailPresent: email\.length > 0/);
+  assert.match(server, /passwordLength: password\.length/);
+  assert.doesNotMatch(server, /console\.warn\([^\n]*password\s*[,}]/);
 });

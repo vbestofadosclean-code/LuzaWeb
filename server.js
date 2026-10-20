@@ -695,11 +695,32 @@ app.get('/api/health', async (req, res) => {
 
 app.post('/api/auth/register', authRateLimit, async (req, res) => {
   try {
-    const name = String(req.body.name || '').trim();
-    const email = String(req.body.email || '').trim().toLowerCase();
-    const password = String(req.body.password || '');
-    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 6) {
-      return res.status(400).json({ error: 'Preenche nome, email válido e palavra-passe com pelo menos 6 caracteres.' });
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const name = String(body.name || '').trim();
+    const email = String(body.email || '').trim().toLowerCase();
+    const password = String(body.password || '');
+    const nameValid = name.length >= 2;
+    const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    const passwordValid = password.length >= 6;
+    if (!nameValid || !emailValid || !passwordValid) {
+      // Log only validation metadata, never the user's email or password.
+      console.warn('Registration validation failed:', {
+        contentType: req.get('content-type') || '',
+        bodyKeys: Object.keys(body),
+        nameLength: name.length,
+        emailPresent: email.length > 0,
+        emailFormatValid: emailValid,
+        passwordLength: password.length
+      });
+      const invalidFields = [];
+      if (!nameValid) invalidFields.push('nome');
+      if (!emailValid) invalidFields.push('email');
+      if (!passwordValid) invalidFields.push('palavra-passe');
+      return res.status(400).json({
+        error: `Verifica o seguinte campo: ${invalidFields.join(', ')}. O nome deve ter pelo menos 2 caracteres, o email um formato válido e a palavra-passe pelo menos 6 caracteres.`,
+        code: 'AUTH_REGISTER_INVALID_FIELDS',
+        details: { nameValid, emailValid, passwordValid, bodyReceived: Object.keys(body).length > 0 }
+      });
     }
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query('INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email,username,bio,location,website,phone,created_at', [name, email, hash]);

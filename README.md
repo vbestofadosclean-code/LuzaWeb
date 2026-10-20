@@ -1,6 +1,8 @@
 # LUZAWEB — Versão 1
 
-**Versão oficial do projecto: 1.0.0.**
+> Atualização 1.0.1: reforço do envio dos dados do formulário de registo, cache-busting dos ficheiros frontend e mensagens de diagnóstico seguras para campos inválidos. O diagnóstico nunca regista o email ou a palavra-passe completos.
+
+**Versão oficial do projecto: 1.0.1.**
 
 LUZAWEB é uma plataforma web com autenticação, múltiplos projetos, editor de HTML/CSS/JavaScript, deploy real de sites estáticos, base de dados persistente em PostgreSQL e API por projeto.
 

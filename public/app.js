@@ -407,14 +407,26 @@ async function refreshAuthStatus() {
 
 async function api(url, options = {}) {
   if (LOCAL_MODE) return localApi(url, options);
+  const { headers: extraHeaders = {}, ...requestOptions } = options;
   const response = await fetch(url, {
+    ...requestOptions,
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options
+    cache: 'no-store',
+    headers: {
+      'Accept': 'application/json',
+      ...(requestOptions.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...extraHeaders
+    }
   });
   let data = {};
   try { data = await response.json(); } catch {}
-  if (!response.ok) throw new Error(data.error || `Erro ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Erro ${response.status}`);
+    error.status = response.status;
+    error.code = data.code || '';
+    error.details = data.details || null;
+    throw error;
+  }
   return data;
 }
 
@@ -458,14 +470,27 @@ async function login(e) {
 }
 async function register(e) {
   e.preventDefault();
-  const button = $('button', e.currentTarget);
-  button.disabled = true;
+  const form = e.currentTarget;
+  const button = $('button[type=submit]', form);
+  const name = String($('#regName', form)?.value || '').trim();
+  const email = String($('#regEmail', form)?.value || '').trim().toLowerCase();
+  const password = String($('#regPassword', form)?.value || '');
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  if (name.length < 2) { showToast('O nome deve ter pelo menos 2 caracteres.'); return; }
+  if (!emailValid) { showToast('Verifica o formato do email, por exemplo nome@exemplo.com.'); return; }
+  if (password.length < 6) { showToast('A palavra-passe deve ter pelo menos 6 caracteres.'); return; }
+  if (button) button.disabled = true;
   try {
-    const data = await api('/api/auth/register', { method:'POST', body: JSON.stringify({ name: $('#regName').value, email: $('#regEmail').value, password: $('#regPassword').value }) });
+    const payload = { name, email, password };
+    const data = await api('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
     state.user = data.user;
     await openApp();
   } catch (err) { showToast(err.message); }
-  finally { button.disabled = false; }
+  finally { if (button) button.disabled = false; }
 }
 async function checkSession() {
   await detectRuntimeMode();
