@@ -278,7 +278,7 @@ async function localApi(url, options = {}) {
 
   if (url === '/api/auth/register' && method === 'POST') {
     const name=String(body.name||'').trim(), email=String(body.email||'').trim().toLowerCase(), password=String(body.password||'');
-    if (name.length<2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length<6) localApiError('Preenche nome, email válido e palavra-passe com pelo menos 6 caracteres.');
+    if (name.length<2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length<12 || new TextEncoder().encode(password).length>72) localApiError('Preenche nome, email válido e palavra-passe com 12 a 72 bytes.');
     if (db.users.some(u=>u.email===email)) localApiError('Este email já está registado.',409);
     const u={id:localId(db),name,email,password,username:'',bio:'',location:'',website:'',phone:'',created_at:localNow()}; db.users.push(u); db.session_user_id=u.id; respond();
     return {user:{id:u.id,name:u.name,email:u.email,username:u.username,bio:u.bio,location:u.location,website:u.website,phone:u.phone,created_at:u.created_at}};
@@ -306,7 +306,7 @@ async function localApi(url, options = {}) {
   if (url === '/api/account/password' && method === 'POST') {
     if(!user) localApiError('Sessão expirada.',401);
     const current=String(body.currentPassword||''), next=String(body.newPassword||'');
-    if(next.length<6) localApiError('A nova palavra-passe precisa de pelo menos 6 caracteres.');
+    if(next.length<12 || new TextEncoder().encode(next).length>72) localApiError('A nova palavra-passe precisa de 12 a 72 bytes.');
     if(user.password!==current) localApiError('A palavra-passe atual está incorreta.',401);
     user.password=next; respond(); return {ok:true};
   }
@@ -407,26 +407,14 @@ async function refreshAuthStatus() {
 
 async function api(url, options = {}) {
   if (LOCAL_MODE) return localApi(url, options);
-  const { headers: extraHeaders = {}, ...requestOptions } = options;
   const response = await fetch(url, {
-    ...requestOptions,
     credentials: 'same-origin',
-    cache: 'no-store',
-    headers: {
-      'Accept': 'application/json',
-      ...(requestOptions.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      ...extraHeaders
-    }
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options
   });
   let data = {};
   try { data = await response.json(); } catch {}
-  if (!response.ok) {
-    const error = new Error(data.error || `Erro ${response.status}`);
-    error.status = response.status;
-    error.code = data.code || '';
-    error.details = data.details || null;
-    throw error;
-  }
+  if (!response.ok) throw new Error(data.error || `Erro ${response.status}`);
   return data;
 }
 
@@ -448,7 +436,7 @@ function renderAuth(mode='login') {
       <p>Depois de criar a conta, entras no teu workspace e desbloqueias todas as funcionalidades.</p>
       <div class="field"><span>Nome</span><input id="regName" required maxlength="60" placeholder="O teu nome"></div>
       <div class="field"><span>Email</span><input id="regEmail" type="email" required autocomplete="email" placeholder="voce@email.com"></div>
-      <div class="field"><span>Palavra-passe</span><input id="regPassword" type="password" required minlength="6" autocomplete="new-password" placeholder="mínimo 6 caracteres"></div>
+      <div class="field"><span>Palavra-passe</span><input id="regPassword" type="password" required minlength="12" maxlength="72" autocomplete="new-password" placeholder="mínimo 12 caracteres"></div>
       <button class="btn primary wide">Criar conta</button>
       <button type="button" class="auth-back" id="backLanding">← Voltar à página inicial</button>
     </form>`);
@@ -470,27 +458,14 @@ async function login(e) {
 }
 async function register(e) {
   e.preventDefault();
-  const form = e.currentTarget;
-  const button = $('button[type=submit]', form);
-  const name = String($('#regName', form)?.value || '').trim();
-  const email = String($('#regEmail', form)?.value || '').trim().toLowerCase();
-  const password = String($('#regPassword', form)?.value || '');
-  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-  if (name.length < 2) { showToast('O nome deve ter pelo menos 2 caracteres.'); return; }
-  if (!emailValid) { showToast('Verifica o formato do email, por exemplo nome@exemplo.com.'); return; }
-  if (password.length < 6) { showToast('A palavra-passe deve ter pelo menos 6 caracteres.'); return; }
-  if (button) button.disabled = true;
+  const button = $('button', e.currentTarget);
+  button.disabled = true;
   try {
-    const payload = { name, email, password };
-    const data = await api('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
+    const data = await api('/api/auth/register', { method:'POST', body: JSON.stringify({ name: $('#regName').value, email: $('#regEmail').value, password: $('#regPassword').value }) });
     state.user = data.user;
     await openApp();
   } catch (err) { showToast(err.message); }
-  finally { if (button) button.disabled = false; }
+  finally { button.disabled = false; }
 }
 async function checkSession() {
   await detectRuntimeMode();
@@ -672,7 +647,7 @@ function bindTrash() {
     try { await api(`/api/trash/${btn.dataset.id}/restore`, {method:'POST',body:'{}'}); await loadProjects(); await renderTrash(); showToast('Projeto restaurado.'); } catch(err) { showToast(err.message); }
   }));
   $$('.permanent-delete').forEach(btn => btn.addEventListener('click', async () => {
-    if (!confirm('Eliminar este projeto definitivamente? Esta ação não pode ser desfeita.')) return;
+    if (!confirm('Eliminar este projeto definitivamente? Se tiver uma base Neon gerida pelo LuzaWeb, ela também será eliminada no Neon. Confirma que tens um backup; esta operação não pode ser desfeita pelo LuzaWeb.')) return;
     try { await api(`/api/trash/${btn.dataset.id}`, {method:'DELETE'}); await renderTrash(); showToast('Projeto eliminado definitivamente.'); } catch(err) { showToast(err.message); }
   }));
 }
@@ -706,7 +681,7 @@ function renderAccount() {
           <div class="account-meta"><span>Conta criada em</span><strong>${escapeHtml(created)}</strong></div><button class="btn primary">Guardar perfil</button>
         </form>
       </section>
-      <div class="account-security-column"><section class="settings-card"><div class="eyebrow">SEGURANÇA</div><h3>Palavra-passe</h3><p class="muted">Altera a palavra-passe sem terminar a sessão.</p><form id="passwordForm" class="settings-form"><label>Palavra-passe actual<input id="currentPassword" type="password" autocomplete="current-password" required></label><label>Nova palavra-passe<input id="newPassword" type="password" minlength="6" autocomplete="new-password" required></label><label>Confirmar nova palavra-passe<input id="confirmPassword" type="password" minlength="6" autocomplete="new-password" required></label><button class="btn secondary">Actualizar palavra-passe</button></form></section>
+      <div class="account-security-column"><section class="settings-card"><div class="eyebrow">SEGURANÇA</div><h3>Palavra-passe</h3><p class="muted">Altera a palavra-passe sem terminar a sessão.</p><form id="passwordForm" class="settings-form"><label>Palavra-passe actual<input id="currentPassword" type="password" autocomplete="current-password" required></label><label>Nova palavra-passe<input id="newPassword" type="password" minlength="12" maxlength="72" autocomplete="new-password" required></label><label>Confirmar nova palavra-passe<input id="confirmPassword" type="password" minlength="12" maxlength="72" autocomplete="new-password" required></label><button class="btn secondary">Actualizar palavra-passe</button></form></section>
       <section class="settings-card account-help-card"><div class="eyebrow">DICAS DE PERFIL</div><h3>Deixa a conta completa</h3><ul><li>Escolhe um nome de utilizador fácil de reconhecer.</li><li>Escreve uma biografia curta sobre os teus projectos.</li><li>Adiciona o teu site pessoal para mostrar o teu trabalho.</li></ul></section></div>
     </div>
   </div>`;

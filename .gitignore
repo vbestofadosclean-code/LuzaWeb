@@ -6,3 +6,6 @@ npm-debug.log*
 .DS_Store
 .data/
 .netlify/
+
+# Local database backups contain user data and secrets
+backups/

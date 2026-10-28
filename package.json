@@ -1,11 +1,17 @@
 {
   "name": "luzaweb",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "load:smoke": "node scripts/load-smoke.mjs",
+    "secrets:rotate": "node scripts/rotate-secrets.mjs",
+    "history:cleanup": "node scripts/cleanup-history.mjs",
+    "backup:all": "node scripts/backup-all-postgres.mjs",
+    "backup:extract": "node scripts/extract-backup-bundle.mjs",
+    "neon:reconcile": "node scripts/reconcile-neon-lifecycle.mjs"
   },
   "engines": {
     "node": ">=22.5"

@@ -4,8 +4,19 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import crypto from 'crypto';
+import { getRequestClientIp } from './client-ip.js';
 import path from 'path';
 import fs from 'fs/promises';
+import { encryptSecret, decryptSecret, validateSecretConfiguration } from './secret-crypto.js';
+import { normalizeApiErrorEnvelope } from './api-errors.js';
+import { consumeResourceCreationLimit, parseNeonProjectCount, reserveNeonProvisionSlot, resourceQuotaLimits } from './resource-limits.js';
+import { pruneProjectHistory, historyRetentionLimits } from './history-retention.js';
+import { classifyLifecycleDeleteOperation, lifecycleOperationBlocksRestore } from './project-lifecycle.js';
+import { consumePublicApiRateLimit, pruneExpiredApiRateLimits } from './api-rate-limit.js';
+import { claimOperationalAlertCooldown } from './operational-alerts.js';
+import { validateSameOriginMutation } from './request-security.js';
+import { hardenProjectDatabaseRoles } from './postgres-role-hardening.js';
+import { resolvePublicPostgresTarget, buildPinnedPostgresClientConfig, normalizePostgresHostname, validatePostgresPort, allowedPostgresPorts, consumePostgresConnectionTestLimit, isPostgresTargetSecurityError } from './postgres-target-security.js';
 
 const { Pool, Client } = pg;
 // Use the deployed project root instead of import.meta.url. Netlify's esbuild
@@ -13,10 +24,32 @@ const { Pool, Client } = pg;
 const __dirname = path.resolve(process.cwd());
 const __filename = path.join(__dirname, 'server.js');
 const PORT = Number(process.env.PORT || 10000);
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
+const JWT_SECRET = String(process.env.JWT_SECRET || 'dev-only-change-me').trim();
 const COOKIE_NAME = 'luzaweb_token';
 
 const databaseConfigured = Boolean(process.env.DATABASE_URL);
+const DEFAULT_POOL_MAX = process.env.NETLIFY ? 1 : 10;
+function boundedIntegerEnv(name, fallback, min, max) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+}
+const PG_POOL_MAX = boundedIntegerEnv('PG_POOL_MAX', DEFAULT_POOL_MAX, 1, 20);
+const PG_CONNECTION_TIMEOUT_MS = boundedIntegerEnv('PG_CONNECTION_TIMEOUT_MS', 5000, 1000, 30000);
+const PG_STATEMENT_TIMEOUT_MS = boundedIntegerEnv('PG_STATEMENT_TIMEOUT_MS', 15000, 1000, 120000);
+const PG_MIGRATION_LOCK_TIMEOUT_MS = boundedIntegerEnv('PG_MIGRATION_LOCK_TIMEOUT_MS', 15000, 1000, 60000);
+const PG_MIGRATION_STATEMENT_TIMEOUT_MS = boundedIntegerEnv('PG_MIGRATION_STATEMENT_TIMEOUT_MS', 120000, 10000, 180000);
+const PROJECT_POOL_CACHE_MAX = boundedIntegerEnv('PG_PROJECT_POOL_CACHE_MAX', 20, 1, 100);
+const PG_POOL_WAITING_LIMIT = boundedIntegerEnv('PG_POOL_WAITING_LIMIT', 10, 1, 1000);
+const SLOW_REQUEST_ALERT_MS = boundedIntegerEnv('SLOW_REQUEST_ALERT_MS', 2000, 500, 30000);
+const TRUST_PROXY_HOPS = process.env.NETLIFY ? 1 : boundedIntegerEnv('TRUST_PROXY_HOPS', 0, 0, 5);
+const HISTORY_RETENTION = historyRetentionLimits(process.env);
+const RESOURCE_QUOTAS = resourceQuotaLimits(process.env);
+const POSTGRES_ALLOWED_PORTS = allowedPostgresPorts();
+const POSTGRES_CONNECTION_TEST_LIMITS = Object.freeze({
+  perIp: boundedIntegerEnv('POSTGRES_CONNECTION_TESTS_PER_IP', 5, 1, 100),
+  perProject: boundedIntegerEnv('POSTGRES_CONNECTION_TESTS_PER_PROJECT', 20, 1, 500),
+  windowMs: boundedIntegerEnv('POSTGRES_CONNECTION_TEST_WINDOW_MS', 600000, 60000, 3600000)
+});
 const localDatabasePath = path.join(__dirname, '.data', 'luzaweb.sqlite');
 
 // Production uses PostgreSQL. Load the local SQLite adapter lazily only for
@@ -25,15 +58,32 @@ const localDatabasePath = path.join(__dirname, '.data', 'luzaweb.sqlite');
 let pool = databaseConfigured
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
+      // The internal platform database uses public tables; do not let URL options
+      // silently redirect unqualified application SQL into another schema.
+      options: '-c search_path=public',
       ssl: process.env.DB_SSL_REJECT_UNAUTHORIZED === 'false' ? { rejectUnauthorized: false } : undefined,
-      max: Number(process.env.PG_POOL_MAX || (process.env.NETLIFY ? 1 : 10)),
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000
+      max: PG_POOL_MAX,
+      idleTimeoutMillis: 15000,
+      connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
+      statement_timeout: PG_STATEMENT_TIMEOUT_MS,
+      // Keep the client-side timeout longer than the migration block; ordinary
+      // queries are still bounded by the server-side PG_STATEMENT_TIMEOUT_MS.
+      query_timeout: Math.max(PG_STATEMENT_TIMEOUT_MS, PG_MIGRATION_STATEMENT_TIMEOUT_MS),
+      maxUses: 5000,
+      keepAlive: true
     })
   : null;
 
 // Separate Neon pools keep each project's data in its own real PostgreSQL database.
 const projectDataPools = new Map();
+async function evictProjectPoolIfNeeded() {
+  while (projectDataPools.size > PROJECT_POOL_CACHE_MAX) {
+    const oldestKey = projectDataPools.keys().next().value;
+    const oldest = projectDataPools.get(oldestKey);
+    projectDataPools.delete(oldestKey);
+    if (oldest?.pool) await oldest.pool.end().catch(() => {});
+  }
+}
 
 if (!databaseConfigured) {
   console.warn(`PostgreSQL não configurado. O LUZAWEB está a usar a base local persistente: ${localDatabasePath}`);
@@ -41,40 +91,309 @@ if (!databaseConfigured) {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '2mb' }));
-app.use(cookieParser());
+// Trust the Netlify edge hop for protocol handling; self-hosted deployments do not
+// trust forwarded headers unless the operator explicitly configures proxy hops.
+app.set('trust proxy', TRUST_PROXY_HOPS);
+const alertCooldowns = new Map(); // Local fallback only when the shared DB cannot be reached.
+const ALERT_COOLDOWN_MS = boundedIntegerEnv('ALERT_COOLDOWN_MS', 5 * 60 * 1000, 1000, 60 * 60 * 1000);
+const ALERT_DETAIL_ALLOWLIST = new Set(['request_id','method','route','status','duration_ms','error_code','database_configured','project_id','luza_project_id','provider_project_id','table','action','retry_count','waiting_count']);
+function sanitizeAlertDetails(details = {}) {
+  const safe = {};
+  for (const [key, value] of Object.entries(details || {})) {
+    if (!ALERT_DETAIL_ALLOWLIST.has(key) || value === null || value === undefined) continue;
+    if (typeof value === 'string') safe[key] = value.slice(0, 160);
+    else if (typeof value === 'number' && Number.isFinite(value)) safe[key] = value;
+    else if (typeof value === 'boolean') safe[key] = value;
+  }
+  return safe;
+}
+function routeLabel(req) {
+  if (req?.route?.path) return `${String(req.baseUrl || '')}${String(req.route.path)}`.slice(0, 180);
+  if (req?.path?.startsWith('/api/')) return '/api/*';
+  if (req?.path?.startsWith('/v1/')) return '/v1/*';
+  if (req?.path?.startsWith('/sites/')) return '/sites/*';
+  return '/';
+}
+function localAlertCooldownAvailable(event, now) {
+  const previous = alertCooldowns.get(event) || 0;
+  if (now - previous < ALERT_COOLDOWN_MS) return false;
+  alertCooldowns.set(event, now);
+  if (alertCooldowns.size > 200) {
+    for (const [key, sentAt] of alertCooldowns) if (now - sentAt > ALERT_COOLDOWN_MS * 10) alertCooldowns.delete(key);
+  }
+  return true;
+}
+function logEvent(level, event, fields = {}) {
+  // Do not include request bodies, cookies, query strings, credentials or raw IPs.
+  const entry = { timestamp: new Date().toISOString(), level, service: 'luzaweb', event, ...fields };
+  const line = JSON.stringify(entry);
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+}
+if (pool && typeof pool.on === 'function') {
+  pool.on('error', error => {
+    const errorCode = String(error?.code || 'unknown').slice(0, 40);
+    logEvent('error', 'postgres_pool_idle_client_error', { error_code: errorCode });
+    void sendOperationalAlert('database_pool_error', { error_code: errorCode });
+  });
+}
+async function sendOperationalAlert(event, details = {}) {
+  const webhook = String(process.env.ALERT_WEBHOOK_URL || '').trim();
+  if (!webhook) return false;
+  let parsed;
+  try { parsed = new URL(webhook); }
+  catch {
+    logEvent('warn', 'alert_webhook_rejected', { reason: 'invalid URL', alert_event: event });
+    return false;
+  }
+  if (!['https:', 'http:'].includes(parsed.protocol) || (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:')) {
+    logEvent('warn', 'alert_webhook_rejected', { reason: 'HTTPS required in production and HTTP(S) only supported', alert_event: event });
+    return false;
+  }
+
+  const now = Date.now();
+  const localPrevious = alertCooldowns.get(event) || 0;
+  if (now - localPrevious < ALERT_COOLDOWN_MS) return false;
+  let canSend = false;
+  if (pool && typeof pool.query === 'function') {
+    try {
+      canSend = await claimOperationalAlertCooldown(pool, event, now, ALERT_COOLDOWN_MS);
+      // Remember even a shared-denied claim locally so a busy instance does not
+      // issue another database query for every duplicate alert.
+      alertCooldowns.set(event, now);
+    } catch (error) {
+      // When the internal DB is unavailable, use a process-local fallback so an
+      // outage notification can still be attempted. The fallback cannot coordinate
+      // multiple serverless instances; the next successful DB query restores it.
+      canSend = localAlertCooldownAvailable(event, now);
+      if (canSend) logEvent('warn', 'shared_alert_cooldown_unavailable', { alert_event: event, error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
+    }
+  } else canSend = localAlertCooldownAvailable(event, now);
+  if (!canSend) return false;
+
+  try {
+    const response = await fetch(parsed, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ service: 'LUZAWEB', event, environment: process.env.NODE_ENV || 'development', timestamp: new Date().toISOString(), details: sanitizeAlertDetails(details) }),
+      signal: AbortSignal.timeout(3000)
+    });
+    if (!response.ok) logEvent('warn', 'alert_webhook_failed', { alert_event: event, status: response.status });
+    return response.ok;
+  } catch (error) {
+    // Avoid logging error.message: fetch errors may include the webhook URL/token.
+    logEvent('warn', 'alert_webhook_failed', { alert_event: event, error_code: String(error?.cause?.code || error?.code || error?.name || 'request_failed').slice(0, 40) });
+    return false;
+  }
+}
+
+function respondApiError(req, res, error, publicMessage = 'Não foi possível concluir o pedido.', status = 500) {
+  const internalCode = String(error?.code || error?.name || 'unknown').slice(0, 48);
+  logEvent('error', 'api_request_failed', {
+    request_id: req.requestId || null,
+    method: req.method,
+    route: routeLabel(req),
+    status,
+    error_code: internalCode
+  });
+  if (res.headersSent) return res.end();
+  return res.status(status).json({
+    error: publicMessage,
+    request_id: req.requestId || null
+  });
+}
+
 app.use((req, res, next) => {
+  const requestId = crypto.randomUUID();
+  const started = Date.now();
+  req.requestId = requestId;
+  // Normalize all API error responses centrally. 5xx bodies always receive a
+  // safe public message and only a small allowlist of metadata is preserved;
+  // raw database/provider exception text can never reach API clients.
+  const originalJson = res.json.bind(res);
+  res.json = body => {
+    const isApi = req.path === '/api' || req.path.startsWith('/api/') || req.path === '/v1' || req.path.startsWith('/v1/');
+    const hasErrorBody = body && typeof body === 'object' && typeof body.error === 'string';
+    if (isApi && (res.statusCode >= 400 || hasErrorBody)) {
+      body = normalizeApiErrorEnvelope(res.statusCode, body, requestId);
+    }
+    return originalJson(body);
+  };
+  res.setHeader('X-Request-ID', requestId);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   if (req.path.startsWith('/api/')) res.setHeader('Cache-Control', 'no-store');
+  res.on('finish', () => {
+    const durationMs = Date.now() - started;
+    const status = res.statusCode;
+    const route = routeLabel(req);
+    if (req.path.startsWith('/api/') || status >= 500 || durationMs >= SLOW_REQUEST_ALERT_MS) {
+      logEvent(durationMs >= SLOW_REQUEST_ALERT_MS ? 'warn' : status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info',
+        durationMs >= SLOW_REQUEST_ALERT_MS ? 'slow_http_request' : 'http_request', {
+          request_id: requestId, method: req.method, route, status, duration_ms: durationMs
+        });
+    }
+    if (status >= 500) void sendOperationalAlert('http_5xx', { request_id: requestId, method: req.method, route, status });
+    if (durationMs >= SLOW_REQUEST_ALERT_MS && req.path !== '/api/health/live') {
+      void sendOperationalAlert('slow_http_request', { request_id: requestId, method: req.method, route, status, duration_ms: durationMs });
+    }
+  });
   next();
 });
+// Cookie-authenticated dashboard mutations are same-origin only. This protects
+// login/registration and every state-changing /api route, including deploy and
+// snapshot restore. Published user sites are additionally delivered with a CSP
+// sandbox that deliberately omits allow-same-origin, so their scripts have an
+// opaque origin and cannot pass this check using the dashboard's session cookie.
+function enforceSameOriginMutations(req, res, next) {
+  const verdict = validateSameOriginMutation(req);
+  if (verdict.ok) return next();
+  res.setHeader('Cache-Control', 'no-store');
+  logEvent('warn', 'csrf_origin_rejected', {
+    request_id: req.requestId || null,
+    method: req.method,
+    route: '/api/*',
+    reason: verdict.reason
+  });
+  return res.status(403).json({
+    error: 'Pedido bloqueado por verificação de origem. Atualiza a página e tenta novamente.',
+    code: 'CSRF_ORIGIN_REJECTED',
+    request_id: req.requestId || null
+  });
+}
+// Reject cross-origin mutations before parsing request bodies to reduce work on blocked requests.
+app.use('/api', enforceSameOriginMutations);
+
+// Parse bodies/cookies after request tracking and the early CSRF check so malformed JSON
+// errors also receive a request ID and the same safe API error envelope.
+app.use(express.json({ limit: '2mb' }));
+app.use(cookieParser());
 
 const BINARY_FILE_PREFIX = 'LUZAWEB_BINARY_V1|';
 const MAX_FILE_BYTES = 300_000;
 const MAX_FILES_PER_PROJECT = 120;
+const MAX_FOLDERS_PER_PROJECT = 300;
 const MAX_PROJECT_BYTES = 5_000_000;
 const DB_COLUMN_TYPES = new Set(['text', 'number', 'boolean', 'date']);
 
-const authAttempts = new Map();
-function authRateLimit(req, res, next) {
-  const ip = String(req.ip || 'unknown');
-  const now = Date.now();
-  const item = authAttempts.get(ip) || { count: 0, reset: now + 10 * 60 * 1000 };
-  if (now > item.reset) {
-    item.count = 0;
-    item.reset = now + 10 * 60 * 1000;
-  }
-  if (item.count >= 20) return res.status(429).json({ error: 'Demasiadas tentativas. Tenta novamente dentro de alguns minutos.' });
-  item.count += 1;
-  authAttempts.set(ip, item);
-  next();
+// Shared PostgreSQL/SQLite rate-limit storage. Counters represent failed logins only,
+// so a successful login does not consume the user's attempt budget. Hashed bucket keys
+// avoid storing raw email addresses or IP addresses in this table.
+const authAttempts = new Map(); // fallback only for unusual local DB errors
+let authCleanupCounter = 0;
+const AUTH_LIMITS = [
+  { kind: 'ip', max: 10, windowMs: 10 * 60 * 1000 },
+  { kind: 'email', max: 5, windowMs: 15 * 60 * 1000 }
+];
+function authBucketKey(kind, value) {
+  return `auth:${kind}:` + crypto.createHash('sha256').update(String(value || 'unknown').toLowerCase()).digest('hex');
 }
-setInterval(() => {
+function authBuckets(req) {
+  const ip = getRequestClientIp(req).slice(0, 100);
+  const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 254);
+  return [
+    { key: authBucketKey('ip', ip), max: AUTH_LIMITS[0].max, windowMs: AUTH_LIMITS[0].windowMs },
+    ...(email ? [{ key: authBucketKey('email', email), max: AUTH_LIMITS[1].max, windowMs: AUTH_LIMITS[1].windowMs }] : [])
+  ];
+}
+async function readAuthAttempt(bucket, now) {
+  try {
+    const { rows } = await pool.query('SELECT attempts, reset_at FROM auth_rate_limits WHERE bucket_key=$1', [bucket.key]);
+    if (!rows[0]) return { count: 0, reset: now + bucket.windowMs };
+    const reset = Number(rows[0].reset_at);
+    if (!Number.isFinite(reset) || reset <= now) return { count: 0, reset: now + bucket.windowMs };
+    return { count: Number(rows[0].attempts) || 0, reset };
+  } catch (error) {
+    // SQLite fallback supports local offline development. In production a failure
+    // of the shared limiter must not silently disable protection.
+    if (databaseConfigured) throw error;
+    const item = authAttempts.get(bucket.key);
+    if (!item || item.reset <= now) return { count: 0, reset: now + bucket.windowMs };
+    return item;
+  }
+}
+async function recordAuthFailure(req) {
   const now = Date.now();
-  for (const [key, item] of authAttempts.entries()) if (now > item.reset) authAttempts.delete(key);
-}, 15 * 60 * 1000).unref();
+  for (const bucket of authBuckets(req)) {
+    const reset = now + bucket.windowMs;
+    try {
+      await pool.query(`INSERT INTO auth_rate_limits(bucket_key,attempts,reset_at) VALUES($1,1,$2)
+        ON CONFLICT(bucket_key) DO UPDATE SET
+          attempts=CASE WHEN auth_rate_limits.reset_at <= $3 THEN 1 ELSE auth_rate_limits.attempts+1 END,
+          reset_at=CASE WHEN auth_rate_limits.reset_at <= $3 THEN $2 ELSE auth_rate_limits.reset_at END`,
+      [bucket.key, reset, now]);
+    } catch (error) {
+      if (databaseConfigured) throw error;
+      const old = authAttempts.get(bucket.key);
+      const item = !old || old.reset <= now ? { count: 1, reset } : { count: old.count + 1, reset: old.reset };
+      authAttempts.set(bucket.key, item);
+    }
+  }
+  if (authAttempts.size > 5000) {
+    for (const [key, item] of authAttempts) if (item.reset <= now) authAttempts.delete(key);
+    while (authAttempts.size > 5000) authAttempts.delete(authAttempts.keys().next().value);
+  }
+  // Periodically prune expired shared counters so the table cannot grow forever.
+  authCleanupCounter += 1;
+  if (authCleanupCounter % 50 === 0) {
+    try { await pool.query('DELETE FROM auth_rate_limits WHERE reset_at <= $1', [now]); }
+    catch (error) { if (databaseConfigured) throw error; }
+  }
+}
+async function clearAuthEmailFailures(req) {
+  const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 254);
+  if (!email) return;
+  const key = authBucketKey('email', email);
+  try { await pool.query('DELETE FROM auth_rate_limits WHERE bucket_key=$1', [key]); }
+  catch (error) {
+    if (databaseConfigured) throw error;
+    authAttempts.delete(key);
+  }
+}
+async function authRateLimit(req, res, next) {
+  try {
+    const now = Date.now();
+    for (const bucket of authBuckets(req)) {
+      const item = await readAuthAttempt(bucket, now);
+      if (item.count >= bucket.max) {
+        res.setHeader('Retry-After', String(Math.max(1, Math.ceil((item.reset - now) / 1000))));
+        return res.status(429).json({ error: 'Demasiadas tentativas falhadas. Aguarda alguns minutos antes de tentar novamente.' });
+      }
+    }
+    next();
+  } catch (error) {
+    logEvent('error', 'authentication_rate_limiter_unavailable', { error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
+    return res.status(503).json({ error: 'O serviço de autenticação está temporariamente indisponível. Tenta novamente.' });
+  }
+}
+
+async function registrationRateLimit(req, res, next) {
+  const ip = getRequestClientIp(req).slice(0, 100);
+  const key = authBucketKey('register-ip', ip);
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const max = 10;
+  try {
+    const { rows } = await pool.query('SELECT attempts, reset_at FROM auth_rate_limits WHERE bucket_key=$1', [key]);
+    const item = rows[0];
+    if (item && Number(item.reset_at) > now && Number(item.attempts) >= max) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((Number(item.reset_at) - now) / 1000))));
+      return res.status(429).json({ error: 'Demasiadas tentativas de registo a partir desta ligação. Tenta novamente mais tarde.' });
+    }
+    await pool.query(`INSERT INTO auth_rate_limits(bucket_key,attempts,reset_at) VALUES($1,1,$2)
+      ON CONFLICT(bucket_key) DO UPDATE SET
+        attempts=CASE WHEN auth_rate_limits.reset_at <= $3 THEN 1 ELSE auth_rate_limits.attempts+1 END,
+        reset_at=CASE WHEN auth_rate_limits.reset_at <= $3 THEN $2 ELSE auth_rate_limits.reset_at END`,
+    [key, now + windowMs, now]);
+    authCleanupCounter += 1;
+    if (authCleanupCounter % 50 === 0) await pool.query('DELETE FROM auth_rate_limits WHERE reset_at <= $1', [now]);
+    next();
+  } catch (error) {
+    logEvent('error', 'registration_rate_limiter_unavailable', { error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
+    return res.status(503).json({ error: 'O serviço de registo está temporariamente indisponível. Tenta novamente.' });
+  }
+}
 
 function slugify(value) {
   const slug = String(value || '')
@@ -83,9 +402,16 @@ function slugify(value) {
   return slug || `site-${Date.now()}`;
 }
 function cleanPath(input) {
-  let value = String(input || '').trim().replace(/\\/g, '/');
-  value = value.split('/').filter(part => part && part !== '.' && part !== '..').join('/');
-  return value.slice(0, 180);
+  if (typeof input !== 'string') return '';
+  let value = input.trim().replace(/\\/g, '/');
+  // Repository paths are virtual paths, never filesystem paths. Reject traversal
+  // instead of silently removing segments, and reject truncation/collision risks.
+  if (!value || value.startsWith('/') || /^[a-zA-Z]:/.test(value) || /[\u0000-\u001f\u007f]/.test(value)) return '';
+  const rawParts = value.split('/');
+  if (rawParts.some(part => part === '.' || part === '..')) return '';
+  value = rawParts.filter(Boolean).join('/');
+  if (!value || value.length > 180) return '';
+  return value;
 }
 function allowedFile(filePath) { return Boolean(cleanPath(filePath)); }
 function parseBinaryContent(content) {
@@ -107,8 +433,8 @@ function isPrivatePublishedPath(filePath) {
   const parts = cleanPath(filePath).toLowerCase().split('/').filter(Boolean);
   if (parts.some(part => part.startsWith('.') && part !== '.well-known')) return true;
   const name = parts.at(-1) || '';
-  return /^(?:\.env(?:\..*)?|\.npmrc|\.yarnrc(?:\.yml)?|id_rsa|id_ed25519|authorized_keys|known_hosts)$/i.test(name) ||
-    /\.(?:pem|key|p12|pfx|sqlite|sqlite3|db|dump|bak|backup|secret|secrets)$/i.test(name);
+  return /^(?:\.env(?:\..*)?|\.npmrc|\.yarnrc(?:\.yml)?|id_rsa|id_ed25519|authorized_keys|known_hosts|credentials(?:\..*)?|secrets?(?:\..*)?|service[-_]?account(?:\..*)?)$/i.test(name) ||
+    /\.(?:pem|key|p12|pfx|sqlite|sqlite3|db|dump|bak|backup|secret|secrets|keystore|jks|p8)$/i.test(name);
 }
 function safeName(value, fallback = 'item') {
   const name = String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -210,7 +536,11 @@ async function provisionProjectDbConnection(projectId, databaseRow) {
     }
     await client.query(`GRANT CONNECT ON DATABASE ${quotePgIdentifier(databaseName)} TO ${quotePgIdentifier(roleName)}`);
     await client.query(`CREATE SCHEMA IF NOT EXISTS ${quotePgIdentifier(schemaName)}`);
-    await client.query(`GRANT USAGE, CREATE ON SCHEMA ${quotePgIdentifier(schemaName)} TO ${quotePgIdentifier(roleName)}`);
+    // Project credentials can use their isolated schema but cannot create arbitrary
+    // objects or fall back to the shared public schema. The platform backend owns DDL.
+    await client.query(`GRANT USAGE ON SCHEMA ${quotePgIdentifier(schemaName)} TO ${quotePgIdentifier(roleName)}`);
+    await client.query(`REVOKE CREATE ON SCHEMA ${quotePgIdentifier(schemaName)} FROM ${quotePgIdentifier(roleName)}`);
+    await client.query(`REVOKE ALL ON SCHEMA public FROM ${quotePgIdentifier(roleName)}`);
     await client.query(`ALTER ROLE ${quotePgIdentifier(roleName)} IN DATABASE ${quotePgIdentifier(databaseName)} SET search_path TO ${quotePgLiteral(schemaName)}`);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${quotePgIdentifier(schemaName)} TO ${quotePgIdentifier(roleName)}`);
     await client.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${quotePgIdentifier(schemaName)} TO ${quotePgIdentifier(roleName)}`);
@@ -257,7 +587,7 @@ function connectionUriFromPayload(payload) {
 async function neonApiRequest(pathname, { method = 'GET', body } = {}) {
   if (!process.env.NEON_API_KEY) throw new Error('A criação de bases PostgreSQL reais precisa da variável NEON_API_KEY configurada nos segredos do servidor.');
   const url = new URL(`https://console.neon.tech/api/v2${pathname}`);
-  if (process.env.NEON_ORG_ID && url.pathname === '/api/v2/projects') url.searchParams.set('org_id', process.env.NEON_ORG_ID);
+  if (process.env.NEON_ORG_ID && ['/api/v2/projects', '/api/v2/projects/count'].includes(url.pathname)) url.searchParams.set('org_id', process.env.NEON_ORG_ID);
   const response = await fetch(url, {
     method,
     headers: { 'Authorization': `Bearer ${process.env.NEON_API_KEY}`, 'Accept': 'application/json', 'Content-Type': 'application/json' },
@@ -269,9 +599,35 @@ async function neonApiRequest(pathname, { method = 'GET', body } = {}) {
   try { payload = textBody ? JSON.parse(textBody) : {}; } catch { payload = {}; }
   if (!response.ok) {
     const detail = payload?.message || payload?.error || payload?.errors?.[0]?.message || `HTTP ${response.status}`;
-    throw new Error(`O Neon não conseguiu concluir a operação (${String(detail).slice(0, 220)}). Verifica a chave API, organização, região e limites da conta.`);
+    const error = new Error(`O Neon não conseguiu concluir a operação (${String(detail).slice(0, 220)}). Verifica a chave API, organização, região e limites da conta.`);
+    error.httpStatus = response.status;
+    error.providerCode = String(payload?.code || payload?.error_code || 'NEON_API_ERROR').slice(0, 80);
+    throw error;
   }
   return payload;
+}
+async function deleteNeonProjectResource(projectId, { checkFirst = true } = {}) {
+  if (!/^[a-z0-9-]{1,60}$/i.test(String(projectId || ''))) throw new Error('Identificador do projeto Neon inválido; a eliminação foi bloqueada.');
+  const path = `/projects/${encodeURIComponent(projectId)}`;
+  // For an already-managed project, inspect it first so retries are safe after
+  // uncertain network failures. During cleanup of a project created moments ago,
+  // skip GET because provider read-after-write visibility can lag behind POST.
+  if (checkFirst) {
+    try {
+      await neonApiRequest(path);
+    } catch (error) {
+      if (Number(error?.httpStatus) === 404 || Number(error?.httpStatus) === 410) return { alreadyAbsent: true };
+      throw error;
+    }
+  }
+  try {
+    return await neonApiRequest(path, { method: 'DELETE' });
+  } catch (error) {
+    // Treat provider-confirmed absence as a reconciled success, not a reason to
+    // orphan local metadata. Other failures preserve the durable operation row.
+    if (Number(error?.httpStatus) === 404 || Number(error?.httpStatus) === 410) return { alreadyAbsent: true };
+    throw error;
+  }
 }
 async function waitForNeonConnectionUri(projectId, databaseName, roleName, branchId, pooled = false) {
   const query = new URLSearchParams({ database_name: databaseName, role_name: roleName });
@@ -303,10 +659,47 @@ async function createNeonProjectDatabase(project, input) {
 
   let createdProjectId = '';
   try {
-    const created = await neonApiRequest('/projects', { method: 'POST', body: { project: { name: `${name}-luzaweb-${project.id}`.slice(0, 60), region_id: regionId, pg_version: pgVersion } } });
+    // Check the real provider account before creating anything. The API count
+    // can exclude in-flight projects, so local pending reservations are added
+    // to reserve headroom across concurrent LuzaWeb instances.
+    const countPayload = await neonApiRequest('/projects/count');
+    const providerProjectCount = parseNeonProjectCount(countPayload);
+    if (providerProjectCount === null) {
+      const error = new Error('Não foi possível confirmar o número de projetos da conta Neon; a criação foi bloqueada para evitar ultrapassar os limites.');
+      error.code = 'NEON_PROJECT_COUNT_UNAVAILABLE'; error.statusCode = 503;
+      throw error;
+    }
+    const pending = await pool.query("SELECT COUNT(*)::int AS count FROM neon_provision_reservations WHERE state IN ('pending','cleanup_required')");
+    const pendingReservations = Number(pending.rows?.[0]?.count || 0);
+    if (providerProjectCount + pendingReservations > RESOURCE_QUOTAS.neonAccountProjectLimit) {
+      const error = new Error('A conta Neon atingiu o limite de projetos reservado para o LuzaWeb. Revê os recursos existentes antes de criar outra base.');
+      error.code = 'NEON_ACCOUNT_PROJECT_LIMIT'; error.statusCode = 429;
+      throw error;
+    }
+    // Keep the LuzaWeb project ID at the end even for a user-supplied name at
+    // the maximum length. This makes provider resources identifiable during
+    // manual orphan reconciliation if the process dies before the ID is stored.
+    const providerNameSuffix = `-luzaweb-${project.id}`;
+    const providerNameBase = name.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
+    const providerProjectName = `${providerNameBase.slice(0, Math.max(2, 60 - providerNameSuffix.length))}${providerNameSuffix}`;
+    const created = await neonApiRequest('/projects', { method: 'POST', body: { project: { name: providerProjectName, region_id: regionId, pg_version: pgVersion } } });
     const neonProject = created.project || created.projects?.[0] || {};
     createdProjectId = String(neonProject.id || created.project_id || created.id || '');
-    if (!createdProjectId) throw new Error('O Neon criou uma resposta sem identificador de projecto; não é possível concluir a ligação automaticamente.');
+    if (!createdProjectId) {
+      const error = new Error('O Neon confirmou uma criação sem devolver o identificador do projeto; é necessária reconciliação manual antes de tentar novamente.');
+      error.code = 'NEON_PROJECT_ID_MISSING'; error.neonCleanupRequired = true; error.neonProjectId = '';
+      logEvent('error', 'neon_project_created_without_id', { luza_project_id: Number(project.id) });
+      void sendOperationalAlert('neon_project_created_without_id', { luza_project_id: Number(project.id) });
+      throw error;
+    }
+    // Persist the external identifier immediately after creation, before any
+    // further API call can fail or the function instance can be interrupted.
+    const savedReservation = await pool.query("UPDATE neon_provision_reservations SET provider_project_id=$2,updated_at=NOW() WHERE project_id=$1 AND state='pending' RETURNING project_id", [project.id, createdProjectId]);
+    if (!savedReservation.rows?.length) {
+      const error = new Error('O projeto Neon foi criado, mas não foi possível registar a operação pendente no LuzaWeb.');
+      error.neonCleanupRequired = true; error.neonProjectId = createdProjectId; error.code = 'NEON_RESERVATION_PERSIST_FAILED';
+      throw error;
+    }
 
     let branches = created.branches || (created.branch ? [created.branch] : []);
     let branchId = String(created.branch?.id || neonProject.default_branch_id || created.default_branch_id || branches[0]?.id || branches[0]?.branch_id || '');
@@ -379,9 +772,22 @@ async function createNeonProjectDatabase(project, input) {
       }
     };
   } catch (error) {
-    // If creation failed halfway, do not leave a provider project behind when cleanup is possible.
+    // If creation failed halfway, delete the provider project when possible. If
+    // cleanup fails, preserve a reservation so retries cannot silently create
+    // duplicate billable resources; an operator must reconcile it manually.
     if (createdProjectId) {
-      try { await neonApiRequest(`/projects/${encodeURIComponent(createdProjectId)}`, { method: 'DELETE' }); } catch {}
+      try {
+        await deleteNeonProjectResource(createdProjectId, { checkFirst: false });
+        // The provider has confirmed the resource was removed (or absent), so
+        // release the reservation rather than count a cleaned resource forever.
+        error.neonCleanupRequired = false;
+        error.neonProjectId = '';
+      } catch (cleanupError) {
+        error.neonCleanupRequired = true;
+        error.neonProjectId = createdProjectId;
+        logEvent('error', 'neon_project_cleanup_failed', { luza_project_id: Number(project.id), provider_project_id: createdProjectId, error_code: String(cleanupError?.providerCode || cleanupError?.code || 'provider_error').slice(0, 40) });
+        void sendOperationalAlert('neon_project_cleanup_failed', { luza_project_id: Number(project.id), provider_project_id: createdProjectId });
+      }
     }
     throw error;
   }
@@ -393,11 +799,20 @@ async function getProjectDataStore(projectId) {
     const uri = decryptSecret(row.pooled_uri_cipher || row.connection_uri_cipher);
     const fingerprint = crypto.createHash('sha256').update(uri).digest('hex');
     let cached = projectDataPools.get(Number(projectId));
-    if (!cached || cached.fingerprint !== fingerprint) {
+    if (cached && cached.fingerprint === fingerprint) {
+      projectDataPools.delete(Number(projectId));
+      projectDataPools.set(Number(projectId), cached); // LRU: recently used pools move to the end.
+    } else {
       if (cached?.pool) await cached.pool.end().catch(() => {});
-      const projectPool = new Pool({ connectionString: uri, max: 1, idleTimeoutMillis: 10000, connectionTimeoutMillis: 10000 });
+      const projectPool = new Pool({ connectionString: uri, max: 1, idleTimeoutMillis: 10000, connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS, statement_timeout: PG_STATEMENT_TIMEOUT_MS, query_timeout: PG_STATEMENT_TIMEOUT_MS, maxUses: 5000, keepAlive: true });
+      projectPool.on('error', error => {
+        const errorCode = String(error?.code || 'unknown').slice(0, 40);
+        logEvent('error', 'project_postgres_pool_error', { project_id: Number(projectId), error_code: errorCode });
+        void sendOperationalAlert('project_database_pool_error', { project_id: Number(projectId), error_code: errorCode });
+      });
       cached = { fingerprint, pool: projectPool };
       projectDataPools.set(Number(projectId), cached);
+      await evictProjectPoolIfNeeded();
     }
     return { executor: cached.pool, external: true, provider: 'neon' };
   }
@@ -426,12 +841,26 @@ function projectDatabaseConnectionDetails(projectId, databaseRow, clearPassword 
     connection_note: supabaseHosted ? 'O Supabase não disponibiliza uma URL privada separada neste modelo; utiliza a URL de ligação indicada.' : 'A URL é uma ligação à base de dados configurada pelo administrador.'
   };
 }
-async function migrateLogicalTablesToPostgres() {
+async function hardenExistingProjectRoles(executor = pool) {
+  if (!databaseConfigured) return;
+  let databaseName = 'postgres';
+  try { databaseName = decodeURIComponent(new URL(process.env.DATABASE_URL).pathname.replace(/^\/+/, '').split('/')[0] || 'postgres'); } catch {}
+  return hardenProjectDatabaseRoles(executor, {
+    databaseName,
+    onFailure: fields => {
+      logEvent('error', fields.event || 'project_role_hardening_failed', fields);
+      void sendOperationalAlert(fields.event || 'project_role_hardening_failed', fields);
+    }
+  });
+}
+
+async function migrateLogicalTablesToPostgres(executor = null, { manageTransaction = true } = {}) {
   // A transaction-scoped table lock serializes cold-start migrations across
   // Netlify Function instances without relying on session advisory locks.
-  const client = await pool.connect();
+  const ownsClient = !executor;
+  const client = executor || await pool.connect();
   try {
-    await client.query('BEGIN');
+    if (manageTransaction) await client.query('BEGIN');
     await client.query('LOCK TABLE database_tables IN SHARE ROW EXCLUSIVE MODE');
     const { rows: tables } = await client.query(`
       SELECT t.*, d.project_id FROM database_tables t
@@ -459,16 +888,16 @@ async function migrateLogicalTablesToPostgres() {
       }
       await client.query('UPDATE database_tables SET physical_ready=TRUE WHERE id=$1', [table.id]);
     }
-    await client.query('COMMIT');
+    if (manageTransaction) await client.query('COMMIT');
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch {}
+    if (manageTransaction) { try { await client.query('ROLLBACK'); } catch {} }
     throw new Error(`Não foi possível migrar as tabelas existentes para PostgreSQL: ${error.message}`);
   } finally {
-    client.release?.();
+    if (ownsClient) client.release?.();
   }
 }
 
-function signToken(user) { return jwt.sign({ id: user.id, name: user.name, email: user.email, username: user.username || '', bio: user.bio || '', location: user.location || '', website: user.website || '', phone: user.phone || '', created_at: user.created_at || null }, JWT_SECRET, { expiresIn: '7d' }); }
+function signToken(user) { return jwt.sign({ id: user.id, ver: Number(user.token_version || 0), name: user.name, email: user.email, username: user.username || '', bio: user.bio || '', location: user.location || '', website: user.website || '', phone: user.phone || '', created_at: user.created_at || null }, JWT_SECRET, { expiresIn: '7d' }); }
 function setAuthCookie(res, user) {
   res.cookie(COOKIE_NAME, signToken(user), {
     httpOnly: true,
@@ -485,30 +914,24 @@ function getUser(req) {
     return token ? jwt.verify(token, JWT_SECRET) : null;
   } catch { return null; }
 }
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const user = getUser(req);
   if (!user) return res.status(401).json({ error: 'Sessão expirada.' });
-  req.user = user;
-  next();
+  try {
+    // Check persistent session version so password changes can revoke old JWTs.
+    const { rows } = await pool.query('SELECT token_version FROM users WHERE id=$1', [user.id]);
+    if (!rows[0] || Number(rows[0].token_version || 0) !== Number(user.ver || 0)) {
+      clearAuthCookie(res);
+      return res.status(401).json({ error: 'Sessão revogada. Inicia sessão novamente.' });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    logEvent('warn', 'session_validation_failed', { error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
+    return res.status(503).json({ error: 'Não foi possível validar a sessão. Tenta novamente.' });
+  }
 }
 
-function encryptSecret(value) {
-  const key = crypto.createHash('sha256').update(JWT_SECRET).digest();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([cipher.update(String(value ?? ''), 'utf8'), cipher.final()]);
-  return `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${encrypted.toString('base64')}`;
-}
-function decryptSecret(value) {
-  if (!value) return '';
-  try {
-    const [iv, tag, data] = String(value).split('.');
-    const key = crypto.createHash('sha256').update(JWT_SECRET).digest();
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
-    decipher.setAuthTag(Buffer.from(tag, 'base64'));
-    return Buffer.concat([decipher.update(Buffer.from(data, 'base64')), decipher.final()]).toString('utf8');
-  } catch { throw new Error('Não foi possível descodificar um segredo. Confirma se JWT_SECRET não foi alterado.'); }
-}
 function connectionUrl(config, password) {
   const user = encodeURIComponent(config.username);
   const pass = encodeURIComponent(password);
@@ -540,83 +963,176 @@ async function readSchemaFile(schemaFile) {
   throw new Error(`Não foi possível localizar ${schemaFile} no pacote do LUZAWEB: ${lastError?.message || 'ficheiro em falta'}`);
 }
 function initDb() {
-  if (!dbInitializationPromise) dbInitializationPromise = (async () => {
-    if (process.env.NETLIFY && !databaseConfigured) {
-      throw new Error('DATABASE_URL é obrigatória no Netlify. Configura a ligação PostgreSQL interna do LuzaWeb nas variáveis do site.');
-    }
-    if (process.env.NETLIFY && (JWT_SECRET === 'dev-only-change-me' || Buffer.byteLength(JWT_SECRET, 'utf8') < 32 || /replace-with|change-me|your-secret|dev-only/i.test(JWT_SECRET))) {
-      throw new Error('JWT_SECRET é obrigatória no Netlify, deve ter pelo menos 32 bytes e não pode ser um valor de exemplo. Mantém o mesmo segredo entre publicações.');
-    }
-    if (!pool) {
-      // This variable-based dynamic import is intentionally not statically
-      // bundled into Netlify's PostgreSQL-only production function.
-      const localDbModulePath = './local-db.js';
-      const { SQLitePool } = await import(localDbModulePath);
-      pool = new SQLitePool(localDatabasePath);
-    }
-    const schemaFile = databaseConfigured ? 'schema.sql' : 'schema.sqlite.sql';
-    const schema = await readSchemaFile(schemaFile);
-    if (typeof pool.exec === 'function') pool.exec(schema);
-    else await pool.query(schema);
+  if (!dbInitializationPromise) {
+    const attempt = (async () => {
+      if (process.env.NETLIFY && !databaseConfigured) {
+        throw new Error('DATABASE_URL é obrigatória no Netlify. Configura a ligação PostgreSQL interna do LuzaWeb nas variáveis do site.');
+      }
+      // Fail on invalid/missing production keys before opening the database or
+      // accepting requests; one validator is shared with the encryption module.
+      validateSecretConfiguration({ ...process.env, JWT_SECRET });
+      if (!pool) {
+        // This variable-based dynamic import is intentionally not statically
+        // bundled into Netlify's PostgreSQL-only production function.
+        const localDbModulePath = './local-db.js';
+        const { SQLitePool } = await import(localDbModulePath);
+        pool = new SQLitePool(localDatabasePath);
+      }
 
-    // Apply additive migrations to existing databases without changing user data.
-    const profileColumns = [
-      ['username', "TEXT NOT NULL DEFAULT ''"],
-      ['bio', "TEXT NOT NULL DEFAULT ''"],
-      ['location', "TEXT NOT NULL DEFAULT ''"],
-      ['website', "TEXT NOT NULL DEFAULT ''"],
-      ['phone', "TEXT NOT NULL DEFAULT ''"]
-    ];
-    if (databaseConfigured) {
-      for (const [column, definition] of profileColumns) {
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
-      }
-      for (const [tableName, columns] of [
-        ['project_databases', [['schema_name', "TEXT NOT NULL DEFAULT ''"], ['db_username', "TEXT NOT NULL DEFAULT ''"], ['db_password_cipher', "TEXT NOT NULL DEFAULT ''"], ['provisioned_at', 'TIMESTAMPTZ']]],
-        ['project_database_connections', [['provider_project_id', "TEXT NOT NULL DEFAULT ''"], ['provider_branch_id', "TEXT NOT NULL DEFAULT ''"], ['connection_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['pooled_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['region_id', "TEXT NOT NULL DEFAULT ''"], ['pg_version', 'INTEGER NOT NULL DEFAULT 16']]],
-        ['database_tables', [['physical_ready', 'BOOLEAN NOT NULL DEFAULT FALSE'], ['public_read', 'BOOLEAN NOT NULL DEFAULT FALSE'], ['public_insert', 'BOOLEAN NOT NULL DEFAULT FALSE']]],
-        ['api_keys', [['key_type', "TEXT NOT NULL DEFAULT 'secret' CHECK (key_type IN ('secret','publishable'))"]]]
-      ]) {
-        for (const [column, definition] of columns) {
-          await pool.query(`ALTER TABLE ${tableName} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+      let migrationClient = null;
+      let migrationTransactionStarted = false;
+      const migrationExecutor = databaseConfigured ? (migrationClient = await pool.connect()) : pool;
+      try {
+        if (databaseConfigured) {
+          // Transaction-scoped advisory lock works with direct PostgreSQL and
+          // transaction-mode poolers, serializing all startup DDL/data migrations.
+          await migrationExecutor.query('BEGIN');
+          migrationTransactionStarted = true;
+          // A cold start must fail with a controlled error rather than wait forever
+          // behind a stalled migration. The transaction lock serializes all DDL.
+          await migrationExecutor.query(`SET LOCAL lock_timeout = '${PG_MIGRATION_LOCK_TIMEOUT_MS}ms'`);
+          await migrationExecutor.query(`SET LOCAL statement_timeout = '${PG_MIGRATION_STATEMENT_TIMEOUT_MS}ms'`);
+          await migrationExecutor.query('SET LOCAL search_path TO public');
+          await migrationExecutor.query('SELECT pg_advisory_xact_lock($1, $2)', [1280653889, 1]);
         }
-      }
-    } else {
-      const info = await pool.query('PRAGMA table_info(users)');
-      const existing = new Set(info.rows.map(row => row.name));
-      for (const [column, definition] of profileColumns) {
-        if (!existing.has(column)) await pool.query(`ALTER TABLE users ADD COLUMN ${column} ${definition}`);
-      }
-      const additiveColumns = [
-        ['project_databases', [['schema_name', "TEXT NOT NULL DEFAULT ''"], ['db_username', "TEXT NOT NULL DEFAULT ''"], ['db_password_cipher', "TEXT NOT NULL DEFAULT ''"], ['provisioned_at', 'TEXT']], 'project_databases'],
-        ['project_database_connections', [['provider_project_id', "TEXT NOT NULL DEFAULT ''"], ['provider_branch_id', "TEXT NOT NULL DEFAULT ''"], ['connection_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['pooled_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['region_id', "TEXT NOT NULL DEFAULT ''"], ['pg_version', 'INTEGER NOT NULL DEFAULT 16']], 'project_database_connections'],
-        ['database_tables', [['physical_ready', 'INTEGER NOT NULL DEFAULT 0'], ['public_read', 'INTEGER NOT NULL DEFAULT 0'], ['public_insert', 'INTEGER NOT NULL DEFAULT 0']], 'database_tables'],
-        ['api_keys', [['key_type', "TEXT NOT NULL DEFAULT 'secret'"]], 'api_keys']
-      ];
-      for (const [tableName, columns] of additiveColumns) {
-        const tableInfo = await pool.query(`PRAGMA table_info(${tableName})`);
-        const existingColumns = new Set(tableInfo.rows.map(row => row.name));
-        for (const [column, definition] of columns) {
-          if (!existingColumns.has(column)) await pool.query(`ALTER TABLE ${tableName} ADD COLUMN ${column} ${definition}`);
+
+        const schemaFile = databaseConfigured ? 'schema.sql' : 'schema.sqlite.sql';
+        const schema = await readSchemaFile(schemaFile);
+        if (typeof migrationExecutor.exec === 'function') migrationExecutor.exec(schema);
+        else await migrationExecutor.query(schema);
+
+        // Existing PostgreSQL installations receive the project/commit integrity
+        // constraint when safe. SAVEPOINT keeps a detected legacy inconsistency
+        // from aborting the wider startup migration transaction.
+        if (databaseConfigured) {
+          await migrationExecutor.query('SAVEPOINT project_isolation_constraint_migration');
+          try {
+            const unique = await migrationExecutor.query("SELECT 1 FROM pg_constraint WHERE conname='commits_id_project_id_unique' AND conrelid='commits'::regclass LIMIT 1");
+            if (!unique.rowCount) await migrationExecutor.query('ALTER TABLE commits ADD CONSTRAINT commits_id_project_id_unique UNIQUE (id, project_id)');
+            const invalid = await migrationExecutor.query('SELECT 1 FROM deployments d JOIN commits c ON c.id=d.commit_id WHERE d.project_id<>c.project_id LIMIT 1');
+            if (!invalid.rowCount) {
+              const fk = await migrationExecutor.query("SELECT 1 FROM pg_constraint WHERE conname='deployments_commit_project_fk' AND conrelid='deployments'::regclass LIMIT 1");
+              if (!fk.rowCount) await migrationExecutor.query('ALTER TABLE deployments ADD CONSTRAINT deployments_commit_project_fk FOREIGN KEY (commit_id, project_id) REFERENCES commits(id, project_id) ON DELETE RESTRICT');
+            } else {
+              logEvent('error', 'project_isolation_legacy_data_mismatch', { table: 'deployments', action: 'composite constraint not applied' });
+              void sendOperationalAlert('project_isolation_legacy_data_mismatch', { table: 'deployments' });
+            }
+            await migrationExecutor.query('RELEASE SAVEPOINT project_isolation_constraint_migration');
+          } catch (error) {
+            try { await migrationExecutor.query('ROLLBACK TO SAVEPOINT project_isolation_constraint_migration'); await migrationExecutor.query('RELEASE SAVEPOINT project_isolation_constraint_migration'); } catch {}
+            // Only known legacy-data constraint conflicts may be deferred. Permission,
+            // syntax, connection and unexpected failures must abort startup instead of
+            // silently committing a migration without its intended integrity constraint.
+            if (!['23503', '23505'].includes(String(error?.code || ''))) throw error;
+            logEvent('error', 'project_isolation_constraint_migration_failed', { error_code: String(error?.code || 'unknown').slice(0, 40) });
+            void sendOperationalAlert('project_isolation_migration_failed', { error_code: String(error?.code || 'unknown').slice(0, 40) });
+          }
         }
+
+        // Additive migrations run while holding the same PostgreSQL migration
+        // lock. The IF NOT EXISTS guards make retries idempotent after a failure.
+        const profileColumns = [
+          ['token_version', 'INTEGER NOT NULL DEFAULT 0'],
+          ['username', "TEXT NOT NULL DEFAULT ''"],
+          ['bio', "TEXT NOT NULL DEFAULT ''"],
+          ['location', "TEXT NOT NULL DEFAULT ''"],
+          ['website', "TEXT NOT NULL DEFAULT ''"],
+          ['phone', "TEXT NOT NULL DEFAULT ''"]
+        ];
+        if (databaseConfigured) {
+          for (const [column, definition] of profileColumns) {
+            await migrationExecutor.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+          }
+          for (const [tableName, columns] of [
+            ['project_databases', [['schema_name', "TEXT NOT NULL DEFAULT ''"], ['db_username', "TEXT NOT NULL DEFAULT ''"], ['db_password_cipher', "TEXT NOT NULL DEFAULT ''"], ['provisioned_at', 'TIMESTAMPTZ']]],
+            ['project_database_connections', [['provider_project_id', "TEXT NOT NULL DEFAULT ''"], ['provider_branch_id', "TEXT NOT NULL DEFAULT ''"], ['connection_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['pooled_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['region_id', "TEXT NOT NULL DEFAULT ''"], ['pg_version', 'INTEGER NOT NULL DEFAULT 16']]],
+            ['database_tables', [['physical_ready', 'BOOLEAN NOT NULL DEFAULT FALSE'], ['public_read', 'BOOLEAN NOT NULL DEFAULT FALSE'], ['public_insert', 'BOOLEAN NOT NULL DEFAULT FALSE']]],
+            ['api_keys', [['key_type', "TEXT NOT NULL DEFAULT 'secret' CHECK (key_type IN ('secret','publishable'))"]]]
+          ]) {
+            for (const [column, definition] of columns) {
+              await migrationExecutor.query(`ALTER TABLE ${tableName} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+            }
+          }
+        } else {
+          const info = await migrationExecutor.query('PRAGMA table_info(users)');
+          const existing = new Set(info.rows.map(row => row.name));
+          for (const [column, definition] of profileColumns) {
+            if (!existing.has(column)) await migrationExecutor.query(`ALTER TABLE users ADD COLUMN ${column} ${definition}`);
+          }
+          const additiveColumns = [
+            ['project_databases', [['schema_name', "TEXT NOT NULL DEFAULT ''"], ['db_username', "TEXT NOT NULL DEFAULT ''"], ['db_password_cipher', "TEXT NOT NULL DEFAULT ''"], ['provisioned_at', 'TEXT']]],
+            ['project_database_connections', [['provider_project_id', "TEXT NOT NULL DEFAULT ''"], ['provider_branch_id', "TEXT NOT NULL DEFAULT ''"], ['connection_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['pooled_uri_cipher', "TEXT NOT NULL DEFAULT ''"], ['region_id', "TEXT NOT NULL DEFAULT ''"], ['pg_version', 'INTEGER NOT NULL DEFAULT 16']]],
+            ['database_tables', [['physical_ready', 'INTEGER NOT NULL DEFAULT 0'], ['public_read', 'INTEGER NOT NULL DEFAULT 0'], ['public_insert', 'INTEGER NOT NULL DEFAULT 0']]],
+            ['api_keys', [['key_type', "TEXT NOT NULL DEFAULT 'secret'"]]]
+          ];
+          for (const [tableName, columns] of additiveColumns) {
+            const tableInfo = await migrationExecutor.query(`PRAGMA table_info(${tableName})`);
+            const existingColumns = new Set(tableInfo.rows.map(row => row.name));
+            for (const [column, definition] of columns) {
+              if (!existingColumns.has(column)) await migrationExecutor.query(`ALTER TABLE ${tableName} ADD COLUMN ${column} ${definition}`);
+            }
+          }
+        }
+        await migrationExecutor.query("UPDATE project_databases SET schema_name='luza_project_' || project_id WHERE COALESCE(schema_name,'')=''");
+        if (databaseConfigured) {
+          await hardenExistingProjectRoles(migrationExecutor);
+          await migrateLogicalTablesToPostgres(migrationExecutor, { manageTransaction: false });
+          await migrationExecutor.query('COMMIT');
+          migrationTransactionStarted = false;
+        }
+        return true;
+      } catch (error) {
+        if (databaseConfigured && migrationTransactionStarted) {
+          try { await migrationExecutor.query('ROLLBACK'); } catch {}
+        }
+        throw error;
+      } finally {
+        if (databaseConfigured) migrationExecutor.release?.();
       }
-    }
-    await pool.query("UPDATE project_databases SET schema_name='luza_project_' || project_id WHERE COALESCE(schema_name,'')=''");
-    if (databaseConfigured) await migrateLogicalTablesToPostgres();
-    return true;
-  })();
+    })();
+    // Do not cache a rejected initialization promise forever. Serverless instances
+    // can recover from transient database/network failures and retry on next request.
+    dbInitializationPromise = attempt.catch(error => {
+      dbInitializationPromise = undefined;
+      throw error;
+    });
+  }
   return dbInitializationPromise;
 }
 async function getProject(projectId, userId, { includeTrash = false } = {}) {
+  // Never resolve a project by ID alone: ownership is part of every lookup.
+  // Reject malformed identifiers before they reach child-resource queries.
+  const projectKey = Number(projectId);
+  const ownerKey = Number(userId);
+  if (!Number.isSafeInteger(projectKey) || projectKey < 1 || !Number.isSafeInteger(ownerKey) || ownerKey < 1) return null;
   const sql = includeTrash
     ? 'SELECT * FROM projects WHERE id=$1 AND user_id=$2'
     : 'SELECT * FROM projects WHERE id=$1 AND user_id=$2 AND trashed_at IS NULL';
-  const { rows } = await pool.query(sql, [projectId, userId]);
+  const { rows } = await pool.query(sql, [projectKey, ownerKey]);
   return rows[0] || null;
 }
-async function projectSize(projectId, extraPath = null, extraBytes = 0) {
-  const { rows } = await pool.query('SELECT COALESCE(SUM(size_bytes),0)::int AS total FROM files WHERE project_id=$1 AND ($2::text IS NULL OR path<>$2)', [projectId, extraPath]);
+async function projectSize(projectId, extraPath = null, extraBytes = 0, executor = pool) {
+  const { rows } = await executor.query('SELECT COALESCE(SUM(size_bytes),0)::int AS total FROM files WHERE project_id=$1 AND ($2::text IS NULL OR path<>$2)', [projectId, extraPath]);
   return Number(rows[0].total) + Number(extraBytes);
+}
+async function repositoryPathConflict(projectId, targetPath, kind, excludeFileId = null, executor = pool) {
+  const [fileResult, folderResult] = await Promise.all([
+    executor.query('SELECT id,path FROM files WHERE project_id=$1 AND ($2::bigint IS NULL OR id<>$2)', [projectId, excludeFileId]),
+    executor.query('SELECT path FROM project_folders WHERE project_id=$1', [projectId])
+  ]);
+  const target = cleanPath(targetPath);
+  if (!target) return true;
+  const ancestors = [];
+  const parts = target.split('/');
+  for (let i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join('/'));
+  const files = fileResult.rows.map(row => row.path);
+  const folders = folderResult.rows.map(row => row.path);
+  if (kind === 'file') {
+    return files.some(file => file === target || file.startsWith(`${target}/`) || ancestors.includes(file)) ||
+      folders.some(folder => folder === target || folder.startsWith(`${target}/`));
+  }
+  return files.some(file => file === target || file.startsWith(`${target}/`) || ancestors.includes(file)) ||
+    folders.some(folder => folder === target);
 }
 async function seedProject(projectId, executor = pool) {
   const files = [
@@ -683,51 +1199,43 @@ async function getDbTable(tableId, projectId) {
 function generateApiToken() { return `lzw_${crypto.randomBytes(24).toString('hex')}`; }
 function hashToken(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
 
-app.get('/api/health', async (req, res) => {
+app.get('/api/health/live', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, app: 'LUZAWEB', status: 'alive' });
+});
+async function checkReadiness(req, res) {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, app: 'LUZAWEB', database: databaseConfigured ? 'connected' : 'local' });
+    const waitingCount = Number(pool?.waitingCount || 0);
+    if (databaseConfigured && waitingCount > PG_POOL_WAITING_LIMIT) {
+      logEvent('warn', 'database_pool_saturated', { request_id: req.requestId, waiting_count: waitingCount });
+      void sendOperationalAlert('database_pool_saturated', { request_id: req.requestId, waiting_count: waitingCount });
+      return res.status(503).json({ ok: false, app: 'LUZAWEB', status: 'not_ready', database: 'connected_but_saturated', error: 'O serviço está temporariamente sob carga elevada.' });
+    }
+    return res.json({ ok: true, app: 'LUZAWEB', status: 'ready', database: databaseConfigured ? 'connected' : 'local' });
   } catch (error) {
-    console.error('Health check failed:', error.message);
-    res.status(503).json({ ok: false, app: 'LUZAWEB', database: 'unavailable', error: databaseConfigured ? 'Não foi possível ligar ao PostgreSQL.' : 'Não foi possível abrir a base local do LUZAWEB.' });
+    logEvent('error', 'database_health_check_failed', { request_id: req.requestId, error_code: String(error?.code || 'unknown').slice(0, 40) });
+    void sendOperationalAlert('database_unavailable', { request_id: req.requestId, database_configured: databaseConfigured });
+    return res.status(503).json({ ok: false, app: 'LUZAWEB', status: 'not_ready', database: 'unavailable', error: 'A base de dados está temporariamente indisponível.' });
   }
-});
+}
+app.get('/api/health/ready', checkReadiness);
+app.get('/api/health', checkReadiness);
 
-app.post('/api/auth/register', authRateLimit, async (req, res) => {
+app.post('/api/auth/register', registrationRateLimit, async (req, res) => {
   try {
-    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-    const name = String(body.name || '').trim();
-    const email = String(body.email || '').trim().toLowerCase();
-    const password = String(body.password || '');
-    const nameValid = name.length >= 2;
-    const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-    const passwordValid = password.length >= 6;
-    if (!nameValid || !emailValid || !passwordValid) {
-      // Log only validation metadata, never the user's email or password.
-      console.warn('Registration validation failed:', {
-        contentType: req.get('content-type') || '',
-        bodyKeys: Object.keys(body),
-        nameLength: name.length,
-        emailPresent: email.length > 0,
-        emailFormatValid: emailValid,
-        passwordLength: password.length
-      });
-      const invalidFields = [];
-      if (!nameValid) invalidFields.push('nome');
-      if (!emailValid) invalidFields.push('email');
-      if (!passwordValid) invalidFields.push('palavra-passe');
-      return res.status(400).json({
-        error: `Verifica o seguinte campo: ${invalidFields.join(', ')}. O nome deve ter pelo menos 2 caracteres, o email um formato válido e a palavra-passe pelo menos 6 caracteres.`,
-        code: 'AUTH_REGISTER_INVALID_FIELDS',
-        details: { nameValid, emailValid, passwordValid, bodyReceived: Object.keys(body).length > 0 }
-      });
+    const name = String(req.body.name || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 12 || Buffer.byteLength(password, 'utf8') > 72) {
+      return res.status(400).json({ error: 'Preenche nome, email válido e palavra-passe com 12 a 72 bytes.' });
     }
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query('INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email,username,bio,location,website,phone,created_at', [name, email, hash]);
     setAuthCookie(res, rows[0]);
     res.json({ user: rows[0] });
   } catch (error) {
-    console.error('Registration failed:', error.message);
+    logEvent('error', 'registration_failed', { error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
     if (error.code === '23505') return res.status(409).json({ error: 'Este email já está registado.' });
     if (!databaseConfigured) return res.status(503).json({ error: 'O PostgreSQL ainda não está configurado. Define DATABASE_URL no servidor e reinicia o LUZAWEB.' });
     if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT') return res.status(503).json({ error: 'O LUZAWEB não conseguiu ligar ao PostgreSQL. Verifica a DATABASE_URL e a disponibilidade da base de dados.' });
@@ -740,10 +1248,27 @@ app.post('/api/auth/login', authRateLimit, async (req, res) => {
   const password = String(req.body.password || '');
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
-    if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash))) return res.status(401).json({ error: 'Email ou palavra-passe inválidos.' });
+    if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash))) {
+      try { await recordAuthFailure(req); } catch (rateError) {
+        logEvent('error', 'failed_login_counter_write_failed', { error_code: String(rateError?.code || rateError?.name || 'unknown').slice(0, 40) });
+        return res.status(503).json({ error: 'O serviço de autenticação está temporariamente indisponível. Tenta novamente.' });
+      }
+      return res.status(401).json({ error: 'Email ou palavra-passe inválidos.' });
+    }
+    try { await clearAuthEmailFailures(req); } catch (rateError) {
+      // A successful credential check must not fail solely because counter cleanup failed.
+      logEvent('warn', 'successful_login_counter_cleanup_failed', { error_code: String(rateError?.code || rateError?.name || 'unknown').slice(0, 40) });
+    }
     setAuthCookie(res, rows[0]);
     res.json({ user: { id: rows[0].id, name: rows[0].name, email: rows[0].email, username: rows[0].username || '', bio: rows[0].bio || '', location: rows[0].location || '', website: rows[0].website || '', phone: rows[0].phone || '', created_at: rows[0].created_at } });
-  } catch { res.status(500).json({ error: 'Não foi possível iniciar sessão.' }); }
+  } catch (error) {
+    logEvent('error', 'login_failed', { error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
+    if (!databaseConfigured) return res.status(503).json({ error: 'O PostgreSQL ainda não está configurado. Define DATABASE_URL no servidor.' });
+    if (['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET'].includes(error?.code)) {
+      return res.status(503).json({ error: 'O LUZAWEB não conseguiu consultar a base de dados. Tenta novamente dentro de alguns instantes.' });
+    }
+    res.status(500).json({ error: 'Não foi possível iniciar sessão. Consulta os logs do servidor para mais detalhes.' });
+  }
 });
 app.post('/api/auth/logout', (req, res) => { clearAuthCookie(res); res.json({ ok: true }); });
 app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: req.user }));
@@ -763,7 +1288,7 @@ app.put('/api/account', requireAuth, async (req, res) => {
       try { const parsed = new URL(website); if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error(); website = parsed.href; }
       catch { return res.status(400).json({ error: 'Indica um endereço de site válido, começando por https:// ou http://.' }); }
     }
-    const { rows } = await pool.query('UPDATE users SET name=$1,email=$2,username=$3,bio=$4,location=$5,website=$6,phone=$7 WHERE id=$8 RETURNING id,name,email,username,bio,location,website,phone,created_at', [name, email, username, bio, location, website, phone, req.user.id]);
+    const { rows } = await pool.query('UPDATE users SET name=$1,email=$2,username=$3,bio=$4,location=$5,website=$6,phone=$7 WHERE id=$8 RETURNING id,name,email,username,bio,location,website,phone,created_at,token_version', [name, email, username, bio, location, website, phone, req.user.id]);
     setAuthCookie(res, rows[0]);
     res.json({ user: rows[0] });
   } catch (error) {
@@ -775,11 +1300,12 @@ app.post('/api/account/password', requireAuth, async (req, res) => {
   try {
     const current = String(req.body.currentPassword || '');
     const next = String(req.body.newPassword || '');
-    if (next.length < 6) return res.status(400).json({ error: 'A nova palavra-passe precisa de pelo menos 6 caracteres.' });
+    if (next.length < 12 || Buffer.byteLength(next, 'utf8') > 72) return res.status(400).json({ error: 'A nova palavra-passe precisa de 12 a 72 bytes.' });
     const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.user.id]);
     if (!rows[0] || !(await bcrypt.compare(current, rows[0].password_hash))) return res.status(401).json({ error: 'A palavra-passe atual está incorreta.' });
     const hash = await bcrypt.hash(next, 10);
-    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user.id]);
+    const updated = await pool.query('UPDATE users SET password_hash=$1,token_version=token_version+1 WHERE id=$2 RETURNING id,name,email,username,bio,location,website,phone,created_at,token_version', [hash, req.user.id]);
+    setAuthCookie(res, updated.rows[0]);
     res.json({ ok: true });
   } catch { res.status(500).json({ error: 'Não foi possível alterar a palavra-passe.' }); }
 });
@@ -801,28 +1327,76 @@ app.get('/api/projects', requireAuth, async (req, res) => {
 app.post('/api/projects', requireAuth, async (req, res) => {
   const name = String(req.body.name || '').trim();
   const description = String(req.body.description || '').trim();
-  if (!name) return res.status(400).json({ error: 'Indica um nome para o projeto.' });
-  const base = slugify(name);
-  let slug = base;
-  for (let n = 2; ; n++) {
-    const found = await pool.query('SELECT 1 FROM projects WHERE slug=$1', [slug]);
-    if (!found.rowCount) break;
-    slug = `${base}-${n}`;
-  }
-  const client = await pool.connect();
+  if (!name) return res.status(400).json({ error: 'Indica um nome para o projeto.', code: 'PROJECT_NAME_REQUIRED', request_id: req.requestId || null });
+  if (name.length > 100 || description.length > 2000) return res.status(400).json({ error: 'O nome ou a descrição ultrapassa o tamanho permitido.', code: 'PROJECT_INPUT_TOO_LONG', request_id: req.requestId || null });
+
   try {
-    await client.query('BEGIN');
-    const prior = await client.query('SELECT COUNT(*)::int AS count FROM projects WHERE user_id=$1', [req.user.id]);
-    const isFirstProject = Number(prior.rows[0]?.count || 0) === 0;
-    const { rows } = await client.query('INSERT INTO projects(user_id,name,slug,description) VALUES($1,$2,$3,$4) RETURNING *', [req.user.id, name, slug, description]);
-    if (isFirstProject) await seedProject(rows[0].id, client);
-    await ensureProjectDatabase(rows[0].id, client);
-    await client.query('COMMIT');
-    res.json({ project: rows[0] });
+    let rateDecision;
+    try {
+      rateDecision = await consumeResourceCreationLimit(pool, {
+        action: 'project-create', userId: req.user.id, ip: getRequestClientIp(req),
+        perUserLimit: RESOURCE_QUOTAS.projectCreatePerUserPerHour,
+        perIpLimit: RESOURCE_QUOTAS.projectCreatePerIpPerHour,
+        windowMs: RESOURCE_QUOTAS.creationWindowMs
+      });
+    } catch (error) {
+      logEvent('error', 'project_creation_limiter_unavailable', { request_id: req.requestId || null, error_code: String(error?.code || 'unknown').slice(0, 40) });
+      void sendOperationalAlert('project_creation_limiter_unavailable', { request_id: req.requestId || null });
+      return respondApiError(req, res, error, 'O serviço de criação de projetos está temporariamente indisponível.', 503);
+    }
+    if (!rateDecision.allowed) {
+      const retry = Math.max(1, Math.ceil(rateDecision.retryAfterMs / 1000));
+      res.setHeader('Retry-After', String(retry));
+      return res.status(429).json({ error: 'Atingiste o limite de criação de projetos. Tenta novamente mais tarde.', code: 'PROJECT_CREATION_RATE_LIMITED', retry_after_seconds: retry, request_id: req.requestId || null });
+    }
+
+    const client = await pool.connect();
+    let transactionStarted = false;
+    try {
+      await client.query(databaseConfigured ? 'BEGIN' : 'BEGIN IMMEDIATE');
+      transactionStarted = true;
+      if (databaseConfigured) {
+        // Serializes the global cap and slug generation across serverless instances.
+        await client.query('SELECT pg_advisory_xact_lock($1, $2)', [1280653889, 3]);
+        await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
+      }
+      const userCount = await client.query('SELECT COUNT(*)::int AS count FROM projects WHERE user_id=$1', [req.user.id]);
+      const activeUserCount = await client.query('SELECT COUNT(*)::int AS count FROM projects WHERE user_id=$1 AND trashed_at IS NULL', [req.user.id]);
+      const totalCount = await client.query('SELECT COUNT(*)::int AS count FROM projects');
+      const perUser = Number(userCount.rows?.[0]?.count || 0);
+      const activePerUser = Number(activeUserCount.rows?.[0]?.count || 0);
+      const globalCount = Number(totalCount.rows?.[0]?.count || 0);
+      if (perUser >= RESOURCE_QUOTAS.projectsPerUser) {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        return res.status(429).json({ error: `A tua conta atingiu o limite de ${RESOURCE_QUOTAS.projectsPerUser} projetos. Elimina definitivamente projetos que já não precisas ou contacta o administrador.`, code: 'PROJECT_USER_QUOTA_REACHED', limit: RESOURCE_QUOTAS.projectsPerUser, request_id: req.requestId || null });
+      }
+      if (globalCount >= RESOURCE_QUOTAS.projectsGlobal) {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        logEvent('warn', 'global_project_quota_reached', { request_id: req.requestId || null, configured_limit: RESOURCE_QUOTAS.projectsGlobal });
+        void sendOperationalAlert('global_project_quota_reached', { configured_limit: RESOURCE_QUOTAS.projectsGlobal });
+        return res.status(503).json({ error: 'O serviço atingiu temporariamente a capacidade de criação de projetos.', code: 'PROJECT_GLOBAL_QUOTA_REACHED', request_id: req.requestId || null });
+      }
+
+      const base = slugify(name);
+      let slug = base;
+      for (let n = 2; ; n++) {
+        const found = await client.query('SELECT 1 FROM projects WHERE slug=$1', [slug]);
+        if (!found.rowCount) break;
+        slug = `${base}-${n}`;
+      }
+      const { rows } = await client.query('INSERT INTO projects(user_id,name,slug,description) VALUES($1,$2,$3,$4) RETURNING *', [req.user.id, name, slug, description]);
+      if (activePerUser === 0) await seedProject(rows[0].id, client);
+      await ensureProjectDatabase(rows[0].id, client);
+      await client.query('COMMIT'); transactionStarted = false;
+      res.status(201).json({ project: rows[0], quota: { projects_per_user: RESOURCE_QUOTAS.projectsPerUser, projects_remaining: Math.max(0, RESOURCE_QUOTAS.projectsPerUser - (perUser + 1)) } });
+    } catch (error) {
+      if (transactionStarted) { try { await client.query('ROLLBACK'); } catch {} }
+      if (String(error?.code || '') === '23505') return res.status(409).json({ error: 'Já existe um projeto com um identificador semelhante. Tenta novamente com outro nome.', code: 'PROJECT_SLUG_CONFLICT', request_id: req.requestId || null });
+      throw error;
+    } finally { client.release?.(); }
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Não foi possível criar o projeto.' });
-  } finally { client.release(); }
+    respondApiError(req, res, error, 'Não foi possível criar o projeto.');
+  }
 });
 
 app.get('/api/projects/:id', requireAuth, async (req, res) => {
@@ -831,8 +1405,8 @@ app.get('/api/projects/:id', requireAuth, async (req, res) => {
     if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
     const [files, commits, deployments, folders] = await Promise.all([
       pool.query('SELECT id,path,content,size_bytes,updated_at FROM files WHERE project_id=$1 ORDER BY path', [project.id]),
-      pool.query('SELECT id,message,created_at FROM commits WHERE project_id=$1 ORDER BY created_at DESC LIMIT 30', [project.id]),
-      pool.query('SELECT id,commit_id,status,message,created_at,finished_at FROM deployments WHERE project_id=$1 ORDER BY created_at DESC LIMIT 30', [project.id]),
+      pool.query('SELECT id,message,created_at FROM commits WHERE project_id=$1 ORDER BY id DESC LIMIT 30', [project.id]),
+      pool.query('SELECT id,commit_id,status,message,created_at,finished_at FROM deployments WHERE project_id=$1 ORDER BY id DESC LIMIT 30', [project.id]),
       pool.query('SELECT id,path,created_at FROM project_folders WHERE project_id=$1 ORDER BY path', [project.id])
     ]);
     res.json({ project, files: files.rows, commits: commits.rows, deployments: deployments.rows, folders: folders.rows });
@@ -849,11 +1423,195 @@ app.put('/api/projects/:id', requireAuth, async (req, res) => {
   res.json({ project: rows[0] });
 });
 
+async function changeProjectLifecycle(projectId, userId, action) {
+  const client = await pool.connect();
+  let transactionStarted = false;
+  let neonProjectId = '';
+  try {
+    await client.query(databaseConfigured ? 'BEGIN' : 'BEGIN IMMEDIATE');
+    transactionStarted = true;
+    if (databaseConfigured) {
+      // Share the same account/project lifecycle lock as provisioning. The lock
+      // protects the decision and durable operation row, never a network call.
+      await client.query('SELECT pg_advisory_xact_lock($1, $2)', [1280653889, 2]);
+    }
+    const expectedTrashState = action === 'delete' ? 'trashed_at IS NOT NULL' : 'trashed_at IS NULL';
+    const owned = await client.query(`SELECT id FROM projects WHERE id=$1 AND user_id=$2 AND ${expectedTrashState}${databaseConfigured ? ' FOR UPDATE' : ''}`, [projectId, userId]);
+    if (!owned.rows?.[0]) {
+      await client.query('ROLLBACK'); transactionStarted = false;
+      return { ok: false, status: 404, code: 'PROJECT_NOT_FOUND', error: action === 'delete' ? 'Item não encontrado na lixeira.' : 'Projeto não encontrado.' };
+    }
+
+    const reservation = (await client.query('SELECT state FROM neon_provision_reservations WHERE project_id=$1', [projectId])).rows[0];
+    if (reservation && ['pending', 'cleanup_required'].includes(String(reservation.state))) {
+      await client.query('ROLLBACK'); transactionStarted = false;
+      return { ok: false, status: 409, code: reservation.state === 'cleanup_required' ? 'NEON_CLEANUP_REQUIRED' : 'NEON_PROVISION_IN_PROGRESS', error: 'Este projeto tem uma criação de base Neon em curso ou pendente de reconciliação. Resolve-a antes de mover ou eliminar o projeto.' };
+    }
+
+    const lifecycleOperation = (await client.query('SELECT operation,state,provider_project_id,updated_at FROM project_lifecycle_operations WHERE project_id=$1', [projectId])).rows[0];
+    if (action === 'trash') {
+      if (lifecycleOperationBlocksRestore(lifecycleOperation)) {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        return { ok: false, status: 409, code: 'NEON_DELETION_IN_PROGRESS', error: 'Este projeto tem uma operação de eliminação Neon pendente. Resolve-a antes de mover o projeto.' };
+      }
+      await client.query('UPDATE projects SET trashed_at=NOW(),updated_at=NOW() WHERE id=$1 AND user_id=$2 AND trashed_at IS NULL', [projectId, userId]);
+      await client.query('COMMIT'); transactionStarted = false;
+      return { ok: true };
+    }
+
+    if (action !== 'delete') {
+      await client.query('ROLLBACK'); transactionStarted = false;
+      return { ok: false, status: 400, code: 'INVALID_LIFECYCLE_ACTION', error: 'Operação de projeto inválida.' };
+    }
+
+    if (lifecycleOperation) {
+      const decision = classifyLifecycleDeleteOperation(lifecycleOperation);
+      if (decision.action === 'in_progress') {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        return { ok: false, status: 409, code: decision.code, error: 'A eliminação da base Neon deste projeto já está em curso. Aguarda alguns minutos antes de verificar novamente.' };
+      }
+      if (decision.action !== 'retry') {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        logEvent('error', 'neon_delete_reconciliation_blocked', { project_id: Number(projectId), reason: decision.code || 'unknown' });
+        void sendOperationalAlert('neon_delete_reconciliation_blocked', { project_id: Number(projectId) });
+        return { ok: false, status: 409, code: decision.code || 'NEON_LIFECYCLE_RECONCILIATION_REQUIRED', error: 'A referência à base Neon está incompleta. O projeto foi mantido na lixeira para reconciliação administrativa.' };
+      }
+      neonProjectId = decision.providerProjectId;
+      await client.query("UPDATE project_lifecycle_operations SET state='pending',last_error_code='',updated_at=NOW() WHERE project_id=$1", [projectId]);
+    } else {
+      const connection = (await client.query("SELECT provider,provider_project_id,connection_uri_cipher,pooled_uri_cipher FROM project_database_connections WHERE project_id=$1", [projectId])).rows[0];
+      if (connection?.provider === 'neon') {
+        const knownProviderId = String(connection.provider_project_id || '').trim();
+        const hasExternalReference = Boolean(knownProviderId || connection.connection_uri_cipher || connection.pooled_uri_cipher);
+        if (hasExternalReference && !knownProviderId) {
+          await client.query('ROLLBACK'); transactionStarted = false;
+          logEvent('error', 'neon_resource_id_missing_on_delete', { project_id: Number(projectId) });
+          void sendOperationalAlert('neon_resource_id_missing_on_delete', { project_id: Number(projectId) });
+          return { ok: false, status: 409, code: 'NEON_RESOURCE_ID_MISSING', error: 'A configuração indica uma base Neon, mas falta o identificador do projeto no fornecedor. O projeto foi mantido na lixeira para reconciliação; não foi apagado nenhum dado.' };
+        }
+        if (knownProviderId) {
+          neonProjectId = knownProviderId;
+          await client.query(`INSERT INTO project_lifecycle_operations(project_id,user_id,operation,state,provider_project_id,last_error_code,created_at,updated_at)
+            VALUES($1,$2,'delete_neon_project','pending',$3,'',NOW(),NOW())`, [projectId, userId, neonProjectId]);
+        }
+      }
+      if (!neonProjectId) {
+        // Deployments reference commits with ON DELETE RESTRICT, so remove the
+        // deployment rows first before the project's cascading data cleanup.
+        await client.query('DELETE FROM deployments WHERE project_id=$1', [projectId]);
+        await client.query('DELETE FROM projects WHERE id=$1 AND user_id=$2 AND trashed_at IS NOT NULL', [projectId, userId]);
+        await client.query('COMMIT'); transactionStarted = false;
+        return { ok: true };
+      }
+    }
+
+    await client.query('COMMIT'); transactionStarted = false;
+  } catch (error) {
+    if (transactionStarted) { try { await client.query('ROLLBACK'); } catch {} }
+    throw error;
+  } finally {
+    client.release?.();
+  }
+
+  // A durable operation row now blocks restores and duplicate deletion requests.
+  // Close cached connections before asking Neon to remove the remote resource.
+  const cachedProjectPool = projectDataPools.get(Number(projectId));
+  if (cachedProjectPool?.pool) await cachedProjectPool.pool.end().catch(() => {});
+  projectDataPools.delete(Number(projectId));
+  try {
+    await deleteNeonProjectResource(neonProjectId);
+  } catch (error) {
+    const failureCode = String(error?.providerCode || error?.code || (error?.httpStatus ? `HTTP_${error.httpStatus}` : 'NEON_DELETE_FAILED')).slice(0, 80);
+    try {
+      await pool.query("UPDATE project_lifecycle_operations SET state='cleanup_required',last_error_code=$2,updated_at=NOW() WHERE project_id=$1 AND provider_project_id=$3", [projectId, failureCode, neonProjectId]);
+    } catch (stateError) {
+      logEvent('error', 'neon_delete_state_update_failed', { project_id: Number(projectId), error_code: String(stateError?.code || 'unknown').slice(0, 40) });
+    }
+    logEvent('error', 'neon_project_delete_failed', { project_id: Number(projectId), provider_project_id: neonProjectId, error_code: failureCode });
+    void sendOperationalAlert('neon_project_delete_failed', { project_id: Number(projectId), provider_project_id: neonProjectId, error_code: failureCode });
+    const status = [423, 429, 503].includes(Number(error?.httpStatus)) ? (Number(error.httpStatus) === 423 ? 409 : Number(error.httpStatus)) : 502;
+    return { ok: false, status, code: 'NEON_DELETE_FAILED', error: 'Não foi possível confirmar a remoção da base Neon. O projeto e a referência externa foram mantidos na lixeira para nova tentativa ou reconciliação. Não tentes apagar os registos manualmente.' };
+  }
+
+  // Provider deletion completed (or Neon confirmed the resource is already absent).
+  // Only now remove the internal project and all attached metadata.
+  const finalClient = await pool.connect();
+  let finalTransactionStarted = false;
+  try {
+    await finalClient.query(databaseConfigured ? 'BEGIN' : 'BEGIN IMMEDIATE');
+    finalTransactionStarted = true;
+    if (databaseConfigured) await finalClient.query('SELECT pg_advisory_xact_lock($1, $2)', [1280653889, 2]);
+    const finalProject = (await finalClient.query(`SELECT id FROM projects WHERE id=$1 AND user_id=$2 AND trashed_at IS NOT NULL${databaseConfigured ? ' FOR UPDATE' : ''}`, [projectId, userId])).rows[0];
+    if (!finalProject) {
+      await finalClient.query('COMMIT'); finalTransactionStarted = false;
+      return { ok: true };
+    }
+    const operation = (await finalClient.query('SELECT provider_project_id FROM project_lifecycle_operations WHERE project_id=$1', [projectId])).rows[0];
+    const currentConnection = (await finalClient.query('SELECT provider,provider_project_id,connection_uri_cipher,pooled_uri_cipher FROM project_database_connections WHERE project_id=$1', [projectId])).rows[0];
+    const connectionId = String(currentConnection?.provider_project_id || '');
+    const connectionLooksManaged = currentConnection?.provider === 'neon' && Boolean(connectionId || currentConnection.connection_uri_cipher || currentConnection.pooled_uri_cipher);
+    if (String(operation?.provider_project_id || '') !== neonProjectId || (currentConnection && currentConnection.provider !== 'neon') || (connectionLooksManaged && connectionId !== neonProjectId)) {
+      await finalClient.query('ROLLBACK'); finalTransactionStarted = false;
+      logEvent('error', 'neon_delete_finalization_mismatch', { project_id: Number(projectId) });
+      void sendOperationalAlert('neon_delete_finalization_mismatch', { project_id: Number(projectId) });
+      return { ok: false, status: 409, code: 'NEON_DELETE_RECONCILIATION_REQUIRED', error: 'O recurso Neon foi removido, mas o registo interno mudou inesperadamente. O projeto foi preservado para reconciliação.' };
+    }
+    await finalClient.query('DELETE FROM deployments WHERE project_id=$1', [projectId]);
+    await finalClient.query('DELETE FROM projects WHERE id=$1 AND user_id=$2 AND trashed_at IS NOT NULL', [projectId, userId]);
+    await finalClient.query('COMMIT'); finalTransactionStarted = false;
+    return { ok: true };
+  } catch (error) {
+    if (finalTransactionStarted) { try { await finalClient.query('ROLLBACK'); } catch {} finalTransactionStarted = false; }
+    // Reuse the checked-out client so a low-pool deployment (Netlify max=1)
+    // cannot deadlock while borrowing a second connection before release.
+    try {
+      await finalClient.query("UPDATE project_lifecycle_operations SET state='cleanup_required',last_error_code=$2,updated_at=NOW() WHERE project_id=$1 AND provider_project_id=$3", [projectId, String(error?.code || 'LOCAL_FINALIZATION_FAILED').slice(0, 80), neonProjectId]);
+    } catch {}
+    logEvent('error', 'neon_deleted_local_finalization_failed', { project_id: Number(projectId), error_code: String(error?.code || 'unknown').slice(0, 40) });
+    void sendOperationalAlert('neon_deleted_local_finalization_failed', { project_id: Number(projectId) });
+    return { ok: false, status: 503, code: 'NEON_DELETE_RECONCILIATION_REQUIRED', error: 'O Neon confirmou a remoção, mas o LuzaWeb ainda não conseguiu concluir a limpeza local. O registo foi preservado para reconciliação segura.' };
+  } finally {
+    finalClient.release?.();
+  }
+}
+
+async function restoreTrashedProject(projectId, userId) {
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query(databaseConfigured ? 'BEGIN' : 'BEGIN IMMEDIATE');
+    transactionStarted = true;
+    if (databaseConfigured) await client.query('SELECT pg_advisory_xact_lock($1, $2)', [1280653889, 2]);
+    const project = (await client.query(`SELECT id FROM projects WHERE id=$1 AND user_id=$2 AND trashed_at IS NOT NULL${databaseConfigured ? ' FOR UPDATE' : ''}`, [projectId, userId])).rows[0];
+    if (!project) {
+      await client.query('ROLLBACK'); transactionStarted = false;
+      return { ok: false, status: 404, code: 'TRASH_ITEM_NOT_FOUND', error: 'Item não encontrado na lixeira.' };
+    }
+    const operation = (await client.query('SELECT state FROM project_lifecycle_operations WHERE project_id=$1', [projectId])).rows[0];
+    if (lifecycleOperationBlocksRestore(operation)) {
+      await client.query('ROLLBACK'); transactionStarted = false;
+      return { ok: false, status: 409, code: 'NEON_DELETION_RECONCILIATION_REQUIRED', error: 'Este projeto tem uma operação de remoção Neon pendente ou por reconciliar. Resolve-a antes de restaurar o projeto.' };
+    }
+    const reservation = (await client.query('SELECT state FROM neon_provision_reservations WHERE project_id=$1', [projectId])).rows[0];
+    if (reservation && ['pending', 'cleanup_required'].includes(String(reservation.state))) {
+      await client.query('ROLLBACK'); transactionStarted = false;
+      return { ok: false, status: 409, code: 'NEON_PROVISION_RECONCILIATION_REQUIRED', error: 'Este projeto tem uma criação Neon pendente ou por reconciliar. Resolve-a antes de restaurar o projeto.' };
+    }
+    await client.query('UPDATE projects SET trashed_at=NULL,updated_at=NOW() WHERE id=$1 AND user_id=$2 AND trashed_at IS NOT NULL', [projectId, userId]);
+    await client.query('COMMIT'); transactionStarted = false;
+    return { ok: true };
+  } catch (error) {
+    if (transactionStarted) { try { await client.query('ROLLBACK'); } catch {} }
+    throw error;
+  } finally { client.release?.(); }
+}
+
 app.delete('/api/projects/:id', requireAuth, async (req, res) => {
-  const project = await getProject(req.params.id, req.user.id);
-  if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
-  await pool.query('UPDATE projects SET trashed_at=NOW(),updated_at=NOW() WHERE id=$1', [project.id]);
-  res.json({ ok: true });
+  try {
+    const result = await changeProjectLifecycle(req.params.id, req.user.id, 'trash');
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code, request_id: req.requestId || null });
+    res.json({ ok: true });
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível mover o projeto para a lixeira.'); }
 });
 
 app.get('/api/trash', requireAuth, async (req, res) => {
@@ -863,16 +1621,18 @@ app.get('/api/trash', requireAuth, async (req, res) => {
   } catch { res.status(500).json({ error: 'Não foi possível carregar a lixeira.' }); }
 });
 app.post('/api/trash/:id/restore', requireAuth, async (req, res) => {
-  const project = await getProject(req.params.id, req.user.id, { includeTrash: true });
-  if (!project || !project.trashed_at) return res.status(404).json({ error: 'Item não encontrado na lixeira.' });
-  await pool.query('UPDATE projects SET trashed_at=NULL,updated_at=NOW() WHERE id=$1', [project.id]);
-  res.json({ ok: true });
+  try {
+    const result = await restoreTrashedProject(req.params.id, req.user.id);
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code, request_id: req.requestId || null });
+    res.json({ ok: true });
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível restaurar o projeto.'); }
 });
 app.delete('/api/trash/:id', requireAuth, async (req, res) => {
-  const project = await getProject(req.params.id, req.user.id, { includeTrash: true });
-  if (!project || !project.trashed_at) return res.status(404).json({ error: 'Item não encontrado na lixeira.' });
-  await pool.query('DELETE FROM projects WHERE id=$1', [project.id]);
-  res.json({ ok: true });
+  try {
+    const result = await changeProjectLifecycle(req.params.id, req.user.id, 'delete');
+    if (!result.ok) return res.status(result.status).json({ error: result.error, code: result.code, request_id: req.requestId || null });
+    res.json({ ok: true });
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível eliminar definitivamente o projeto.'); }
 });
 
 app.post('/api/projects/:id/folders', requireAuth, async (req, res) => {
@@ -880,22 +1640,37 @@ app.post('/api/projects/:id/folders', requireAuth, async (req, res) => {
   if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
   const folderPath = cleanPath(req.body.path);
   if (!folderPath || folderPath.length > 180) return res.status(400).json({ error: 'Indica um nome de pasta válido.' });
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+    if (databaseConfigured) await client.query('SELECT id FROM projects WHERE id=$1 FOR UPDATE', [project.id]);
+    if (await repositoryPathConflict(project.id, folderPath, 'folder', null, client)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'O caminho da pasta entra em conflito com um ficheiro ou pasta existente.' });
+    }
     const parts = folderPath.split('/');
     let partial = '';
     const folderPaths = [];
     for (const part of parts) { partial = partial ? `${partial}/${part}` : part; folderPaths.push(partial); }
+    const existingFolders = await client.query('SELECT COUNT(*)::int AS count FROM project_folders WHERE project_id=$1', [project.id]);
+    const uniqueMissing = [];
     for (const itemPath of folderPaths) {
-      const fileConflict = await pool.query('SELECT 1 FROM files WHERE project_id=$1 AND path=$2 LIMIT 1', [project.id, itemPath]);
-      if (fileConflict.rowCount) return res.status(409).json({ error: 'Já existe um ficheiro no caminho dessa pasta.' });
+      const exists = await client.query('SELECT 1 FROM project_folders WHERE project_id=$1 AND path=$2 LIMIT 1', [project.id, itemPath]);
+      if (!exists.rowCount) uniqueMissing.push(itemPath);
     }
-    for (const itemPath of folderPaths) {
-      await pool.query('INSERT INTO project_folders(project_id,path) VALUES($1,$2) ON CONFLICT(project_id,path) DO NOTHING', [project.id, itemPath]);
+    if (Number(existingFolders.rows[0]?.count || 0) + uniqueMissing.length > MAX_FOLDERS_PER_PROJECT) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Limite de ${MAX_FOLDERS_PER_PROJECT} pastas por projeto.` });
     }
-    const { rows } = await pool.query('SELECT id,path,created_at FROM project_folders WHERE project_id=$1 AND path=$2', [project.id, folderPath]);
-    await pool.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    for (const itemPath of uniqueMissing) await client.query('INSERT INTO project_folders(project_id,path) VALUES($1,$2) ON CONFLICT(project_id,path) DO NOTHING', [project.id, itemPath]);
+    await client.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    const { rows } = await client.query('SELECT id,path,created_at FROM project_folders WHERE project_id=$1 AND path=$2', [project.id, folderPath]);
+    await client.query('COMMIT');
     res.json({ folder: rows[0] });
-  } catch { res.status(500).json({ error: 'Não foi possível criar a pasta.' }); }
+  } catch {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: 'Não foi possível criar a pasta.' });
+  } finally { client.release?.(); }
 });
 
 app.patch('/api/projects/:id/files/:fileId/path', requireAuth, async (req, res) => {
@@ -903,45 +1678,69 @@ app.patch('/api/projects/:id/files/:fileId/path', requireAuth, async (req, res) 
   if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
   const fileId = Number(req.params.fileId);
   const newPath = cleanPath(req.body.path);
-  if (!newPath || newPath.length > 180) return res.status(400).json({ error: 'Indica um destino válido.' });
+  if (!Number.isSafeInteger(fileId) || fileId < 1 || !newPath) return res.status(400).json({ error: 'Indica um destino válido.' });
+  const client = await pool.connect();
   try {
-    const existingFile = await pool.query('SELECT id,path,content,size_bytes,updated_at FROM files WHERE project_id=$1 AND id=$2', [project.id, fileId]);
-    if (!existingFile.rows[0]) return res.status(404).json({ error: 'Ficheiro não encontrado.' });
-    if (existingFile.rows[0].path === newPath) return res.json({ file: existingFile.rows[0] });
-    const [conflict, folderConflict, childPathConflict] = await Promise.all([
-      pool.query('SELECT 1 FROM files WHERE project_id=$1 AND path=$2 AND id<>$3 LIMIT 1', [project.id, newPath, fileId]),
-      pool.query('SELECT 1 FROM project_folders WHERE project_id=$1 AND path=$2 LIMIT 1', [project.id, newPath]),
-      pool.query("SELECT 1 FROM files WHERE project_id=$1 AND id<>$3 AND SUBSTR(path,1,LENGTH($2)+1)=($2 || '/') LIMIT 1", [project.id, newPath, fileId])
-    ]);
-    if (conflict.rowCount || folderConflict.rowCount || childPathConflict.rowCount) return res.status(409).json({ error: 'Já existe um ficheiro ou pasta com esse nome no destino.' });
-    const { rows } = await pool.query('UPDATE files SET path=$1,updated_at=NOW() WHERE project_id=$2 AND id=$3 RETURNING id,path,content,size_bytes,updated_at', [newPath, project.id, fileId]);
-    await pool.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    await client.query('BEGIN');
+    if (databaseConfigured) await client.query('SELECT id FROM projects WHERE id=$1 FOR UPDATE', [project.id]);
+    const existingFile = await client.query('SELECT id,path,content,size_bytes,updated_at FROM files WHERE project_id=$1 AND id=$2', [project.id, fileId]);
+    if (!existingFile.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Ficheiro não encontrado.' }); }
+    if (existingFile.rows[0].path === newPath) { await client.query('COMMIT'); return res.json({ file: existingFile.rows[0] }); }
+    if (await repositoryPathConflict(project.id, newPath, 'file', fileId, client)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Já existe um ficheiro ou pasta com esse nome no destino.' });
+    }
+    const { rows } = await client.query('UPDATE files SET path=$1,updated_at=NOW() WHERE project_id=$2 AND id=$3 RETURNING id,path,content,size_bytes,updated_at', [newPath, project.id, fileId]);
+    await client.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    await client.query('COMMIT');
     res.json({ file: rows[0] });
-  } catch { res.status(500).json({ error: 'Não foi possível mover o ficheiro.' }); }
+  } catch {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: 'Não foi possível mover o ficheiro.' });
+  } finally { client.release?.(); }
 });
 
 app.post('/api/projects/:id/files', requireAuth, async (req, res) => {
+  const project = await getProject(req.params.id, req.user.id);
+  if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
+  const filePath = cleanPath(req.body.path);
+  const content = String(req.body.content ?? '');
+  const contentBytes = storedContentBytes(content);
+  if (!filePath || !allowedFile(filePath)) return res.status(400).json({ error: 'Indica um caminho de ficheiro válido.' });
+  if (contentBytes > MAX_FILE_BYTES) return res.status(413).json({ error: 'Ficheiro demasiado grande (máximo 300 KB).' });
+  const client = await pool.connect();
   try {
-    const project = await getProject(req.params.id, req.user.id);
-    if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
-    const filePath = cleanPath(req.body.path);
-    const content = String(req.body.content ?? '');
-    if (!filePath || !allowedFile(filePath)) return res.status(400).json({ error: 'Indica um caminho de ficheiro válido.' });
-    if (storedContentBytes(content) > MAX_FILE_BYTES) return res.status(413).json({ error: 'Ficheiro demasiado grande (máximo 300 KB).' });
-    const count = await pool.query('SELECT COUNT(*)::int AS count FROM files WHERE project_id=$1 AND path<>$2', [project.id, filePath]);
-    const exists = await pool.query('SELECT 1 FROM files WHERE project_id=$1 AND path=$2', [project.id, filePath]);
-    if (!exists.rowCount && Number(count.rows[0].count) >= MAX_FILES_PER_PROJECT) return res.status(400).json({ error: `Limite de ${MAX_FILES_PER_PROJECT} ficheiros por projeto.` });
-    const total = await projectSize(project.id, filePath, storedContentBytes(content));
-    if (total > MAX_PROJECT_BYTES) return res.status(400).json({ error: 'O projeto ultrapassaria o limite de 5 MB.' });
-    const { rows } = await pool.query(`
+    await client.query('BEGIN');
+    if (databaseConfigured) await client.query('SELECT id FROM projects WHERE id=$1 FOR UPDATE', [project.id]);
+    const exists = await client.query('SELECT id FROM files WHERE project_id=$1 AND path=$2', [project.id, filePath]);
+    if (await repositoryPathConflict(project.id, filePath, 'file', exists.rows[0]?.id ?? null, client)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'O caminho entra em conflito com um ficheiro ou pasta existente.' });
+    }
+    const count = await client.query('SELECT COUNT(*)::int AS count FROM files WHERE project_id=$1 AND path<>$2', [project.id, filePath]);
+    if (!exists.rowCount && Number(count.rows[0].count) >= MAX_FILES_PER_PROJECT) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Limite de ${MAX_FILES_PER_PROJECT} ficheiros por projeto.` });
+    }
+    const total = await projectSize(project.id, filePath, contentBytes, client);
+    if (total > MAX_PROJECT_BYTES) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O projeto ultrapassaria o limite de 5 MB.' });
+    }
+    const { rows } = await client.query(`
       INSERT INTO files(project_id,path,content,size_bytes) VALUES($1,$2,$3,$4)
       ON CONFLICT(project_id,path) DO UPDATE SET content=EXCLUDED.content,size_bytes=EXCLUDED.size_bytes,updated_at=NOW()
       RETURNING id,path,content,size_bytes,updated_at
-    `, [project.id, filePath, content, storedContentBytes(content)]);
-    await pool.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    `, [project.id, filePath, content, contentBytes]);
+    await client.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    await client.query('COMMIT');
     res.json({ file: rows[0] });
-  } catch { res.status(500).json({ error: 'Não foi possível guardar o ficheiro.' }); }
+  } catch {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: 'Não foi possível guardar o ficheiro.' });
+  } finally { client.release?.(); }
 });
+
 app.delete('/api/projects/:id/files/:fileId', requireAuth, async (req, res) => {
   const project = await getProject(req.params.id, req.user.id);
   if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
@@ -952,17 +1751,34 @@ app.delete('/api/projects/:id/files/:fileId', requireAuth, async (req, res) => {
 });
 
 app.post('/api/projects/:id/commit', requireAuth, async (req, res) => {
+  const project = await getProject(req.params.id, req.user.id);
+  if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
+  const message = String(req.body.message || 'Atualização do projeto').trim().slice(0, 120) || 'Atualização do projeto';
+  const client = await pool.connect();
   try {
-    const project = await getProject(req.params.id, req.user.id);
-    if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
-    const message = String(req.body.message || 'Atualização do projeto').trim().slice(0, 120) || 'Atualização do projeto';
-    const fileRows = await pool.query('SELECT path,content FROM files WHERE project_id=$1 ORDER BY path', [project.id]);
-    if (!fileRows.rows.some(file => file.path === 'index.html')) return res.status(400).json({ error: 'O projeto precisa de um ficheiro index.html na raiz antes do commit.' });
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM projects WHERE id=$1${databaseConfigured ? ' FOR UPDATE' : ''}`, [project.id]);
+    const fileRows = await client.query('SELECT path,content FROM files WHERE project_id=$1 ORDER BY path', [project.id]);
+    if (!fileRows.rows.some(file => file.path === 'index.html')) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O projeto precisa de um ficheiro index.html na raiz antes do commit.' });
+    }
+    const totalBytes = fileRows.rows.reduce((sum, file) => sum + storedContentBytes(String(file.content ?? '')), 0);
+    if (fileRows.rows.length > MAX_FILES_PER_PROJECT || totalBytes > MAX_PROJECT_BYTES || fileRows.rows.some(file => !allowedFile(file.path) || storedContentBytes(String(file.content ?? '')) > MAX_FILE_BYTES)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O projeto excede os limites de ficheiros, caminhos ou tamanho. Revê os ficheiros antes de criar um snapshot.' });
+    }
     const snapshot = Object.fromEntries(fileRows.rows.map(file => [file.path, file.content]));
-    const { rows } = await pool.query('INSERT INTO commits(project_id,message,snapshot) VALUES($1,$2,$3::jsonb) RETURNING id,message,created_at', [project.id, message, JSON.stringify(snapshot)]);
-    await pool.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    const committedAt = new Date().toISOString();
+    const { rows } = await client.query('INSERT INTO commits(project_id,message,snapshot,created_at) VALUES($1,$2,$3::jsonb,$4) RETURNING id,message,created_at', [project.id, message, JSON.stringify(snapshot), committedAt]);
+    await client.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
+    await pruneProjectHistory(client, project.id, HISTORY_RETENTION);
+    await client.query('COMMIT');
     res.json({ commit: rows[0] });
-  } catch { res.status(500).json({ error: 'Não foi possível criar o commit.' }); }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    respondApiError(req, res, error, 'Não foi possível criar o commit.');
+  } finally { client.release?.(); }
 });
 app.post('/api/projects/:id/commits/:commitId/restore', requireAuth, async (req, res) => {
   const project = await getProject(req.params.id, req.user.id);
@@ -972,16 +1788,28 @@ app.post('/api/projects/:id/commits/:commitId/restore', requireAuth, async (req,
   if (!commit) return res.status(404).json({ error: 'Commit não encontrado.' });
   const entries = Object.entries(commit.snapshot || {});
   const totalBytes = entries.reduce((sum, [, content]) => sum + storedContentBytes(String(content ?? '')), 0);
-  if (entries.length > MAX_FILES_PER_PROJECT || totalBytes > MAX_PROJECT_BYTES) return res.status(400).json({ error: 'O commit excede os limites atuais do projeto.' });
+  const normalizedPaths = entries.map(([filePath]) => cleanPath(filePath));
+  if (!entries.some(([filePath]) => filePath === 'index.html')) return res.status(400).json({ error: 'Este snapshot não contém index.html e não pode ser restaurado como projeto publicável.' });
+  if (entries.length > MAX_FILES_PER_PROJECT || totalBytes > MAX_PROJECT_BYTES ||
+      entries.some(([, content]) => storedContentBytes(String(content ?? '')) > MAX_FILE_BYTES) ||
+      normalizedPaths.some((filePath, index) => !filePath || filePath !== entries[index][0]) ||
+      new Set(normalizedPaths).size !== normalizedPaths.length) {
+    return res.status(400).json({ error: 'O commit contém caminhos inválidos ou excede os limites atuais do projeto.' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query('DELETE FROM files WHERE project_id=$1', [project.id]);
+    await client.query('DELETE FROM project_folders WHERE project_id=$1', [project.id]);
+    const restoredFolders = new Set();
     for (const [filePath, content] of entries) {
-      if (!allowedFile(filePath)) continue;
       const clean = cleanPath(filePath);
       await client.query('INSERT INTO files(project_id,path,content,size_bytes) VALUES($1,$2,$3,$4)', [project.id, clean, String(content ?? ''), storedContentBytes(String(content ?? ''))]);
+      const parts = clean.split('/');
+      for (let i = 1; i < parts.length; i++) restoredFolders.add(parts.slice(0, i).join('/'));
     }
+    if (restoredFolders.size > MAX_FOLDERS_PER_PROJECT) throw new Error('O snapshot excede o limite de pastas do projecto.');
+    for (const folderPath of restoredFolders) await client.query('INSERT INTO project_folders(project_id,path) VALUES($1,$2) ON CONFLICT(project_id,path) DO NOTHING', [project.id, folderPath]);
     await client.query('UPDATE projects SET updated_at=NOW() WHERE id=$1', [project.id]);
     await client.query('COMMIT');
     res.json({ ok: true });
@@ -994,23 +1822,38 @@ app.post('/api/projects/:id/commits/:commitId/restore', requireAuth, async (req,
 app.post('/api/projects/:id/deploy', requireAuth, async (req, res) => {
   const project = await getProject(req.params.id, req.user.id);
   if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
-  const fileRows = await pool.query('SELECT path,content FROM files WHERE project_id=$1 ORDER BY path', [project.id]);
-  const index = fileRows.rows.find(file => file.path === 'index.html');
-  if (!index) return res.status(400).json({ error: 'Adiciona um ficheiro index.html (com esse nome exacto) na raiz do projecto antes de publicar.' });
-  const snapshot = Object.fromEntries(fileRows.rows.map(file => [file.path, file.content]));
-  if (Buffer.byteLength(index.content) > MAX_FILE_BYTES) return res.status(400).json({ error: 'O index.html é demasiado grande.' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const commit = await client.query('INSERT INTO commits(project_id,message,snapshot) VALUES($1,$2,$3::jsonb) RETURNING id,created_at', [project.id, 'Publicação automática', JSON.stringify(snapshot)]);
-    const deployment = await client.query('INSERT INTO deployments(project_id,commit_id,status,message,finished_at) VALUES($1,$2,$3,$4,NOW()) RETURNING *', [project.id, commit.rows[0].id, 'LIVE', 'Publicação concluída e disponível online.']);
+    await client.query(`SELECT id FROM projects WHERE id=$1${databaseConfigured ? ' FOR UPDATE' : ''}`, [project.id]);
+    const fileRows = await client.query('SELECT path,content FROM files WHERE project_id=$1 ORDER BY path', [project.id]);
+    const index = fileRows.rows.find(file => file.path === 'index.html');
+    if (!index) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Adiciona um ficheiro index.html (com esse nome exacto) na raiz do projecto antes de publicar.' });
+    }
+    const totalBytes = fileRows.rows.reduce((sum, file) => sum + storedContentBytes(String(file.content ?? '')), 0);
+    if (fileRows.rows.length > MAX_FILES_PER_PROJECT || totalBytes > MAX_PROJECT_BYTES ||
+        fileRows.rows.some(file => !allowedFile(file.path) || storedContentBytes(String(file.content ?? '')) > MAX_FILE_BYTES)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O projeto excede os limites de ficheiros, caminhos ou tamanho e não pode ser publicado.' });
+    }
+    if (storedContentBytes(String(index.content ?? '')) > MAX_FILE_BYTES) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O index.html é demasiado grande.' });
+    }
+    const snapshot = Object.fromEntries(fileRows.rows.map(file => [file.path, file.content]));
+    const publishedAt = new Date().toISOString();
+    const commit = await client.query('INSERT INTO commits(project_id,message,snapshot,created_at) VALUES($1,$2,$3::jsonb,$4) RETURNING id,created_at', [project.id, 'Publicação automática', JSON.stringify(snapshot), publishedAt]);
+    const deployment = await client.query('INSERT INTO deployments(project_id,commit_id,status,message,created_at,finished_at) VALUES($1,$2,$3,$4,$5,$5) RETURNING *', [project.id, commit.rows[0].id, 'LIVE', 'Publicação concluída e disponível online.', publishedAt]);
     await client.query('UPDATE projects SET updated_at=NOW(),published_at=$1 WHERE id=$2', [commit.rows[0].created_at, project.id]);
+    await pruneProjectHistory(client, project.id, HISTORY_RETENTION);
     await client.query('COMMIT');
     res.json({ deployment: deployment.rows[0], url: `/sites/${encodeURIComponent(project.slug)}/` });
-  } catch {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Falha ao publicar o site.' });
-  } finally { client.release(); }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    respondApiError(req, res, error, 'Falha ao publicar o site.');
+  } finally { client.release?.(); }
 });
 
 // Database connection settings. Neon provisioning is server-side; API credentials are never sent to the browser.
@@ -1044,42 +1887,137 @@ app.post('/api/projects/:id/database/connection', requireAuth, async (req, res) 
   try {
     const project = await getProject(req.params.id, req.user.id);
     if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
-    const current = (await pool.query('SELECT provider_project_id FROM project_database_connections WHERE project_id=$1', [project.id])).rows[0];
-    if (current?.provider_project_id) return res.status(409).json({ error: 'Este projecto já tem uma base Neon criada. Não vou substituir as credenciais da base existente por uma ligação manual.' });
     const name = String(req.body.name || '').trim().slice(0,80);
     const provider = String(req.body.provider || 'external').trim().slice(0,40);
-    const hostname = String(req.body.hostname || '').trim().slice(0,255);
-    const port = Number(req.body.port || 5432);
+    const hostnameInput = String(req.body.hostname || '').trim().slice(0,255);
+    const portInput = Number(req.body.port ?? 5432);
     const databaseName = String(req.body.database || '').trim().slice(0,120);
     const username = String(req.body.username || '').trim().slice(0,120);
     const password = String(req.body.password || '');
-    if (!name || !hostname || !databaseName || !username || !password || !Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ error: 'Preenche o nome, hostname, porta, database, username e password válidos.' });
+    if (!name || !hostnameInput || !databaseName || !username || !password) return res.status(400).json({ error: 'Preenche o nome, hostname, database, username e password válidos.' });
+    if (!['external', 'render', 'neon', 'supabase', 'railway', 'other'].includes(provider)) return res.status(400).json({ error: 'Escolhe um fornecedor PostgreSQL válido.' });
+    let hostname;
+    let port;
+    try {
+      hostname = normalizePostgresHostname(hostnameInput);
+      port = validatePostgresPort(portInput, { ports: POSTGRES_ALLOWED_PORTS });
+    } catch {
+      return res.status(400).json({ error: 'Hostname ou porta não permitidos. Usa um servidor PostgreSQL público e uma porta autorizada pelo administrador.' });
+    }
     const encrypted = encryptSecret(password);
-    const { rows } = await pool.query(`INSERT INTO project_database_connections(project_id,name,provider,hostname,port,database_name,username,password_cipher,provider_project_id,provider_branch_id,connection_uri_cipher,pooled_uri_cipher,region_id,pg_version)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','','','',16)
-      ON CONFLICT(project_id) DO UPDATE SET name=EXCLUDED.name,provider=EXCLUDED.provider,hostname=EXCLUDED.hostname,port=EXCLUDED.port,database_name=EXCLUDED.database_name,username=EXCLUDED.username,password_cipher=EXCLUDED.password_cipher,provider_project_id='',provider_branch_id='',connection_uri_cipher='',pooled_uri_cipher='',region_id='',pg_version=16,updated_at=NOW()
-      RETURNING id,name,provider,hostname,port,database_name,username`, [project.id,name,provider,hostname,port,databaseName,username,encrypted]);
-    res.json({ ok: true, connection: { ...rows[0], database: rows[0].database_name, has_password: true } });
-  } catch (error) { res.status(500).json({ error: error.message || 'Não foi possível guardar a configuração.' }); }
+    const client = await pool.connect();
+    let transactionStarted = false;
+    try {
+      await client.query(databaseConfigured ? 'BEGIN' : 'BEGIN IMMEDIATE');
+      transactionStarted = true;
+      if (databaseConfigured) await client.query('SELECT pg_advisory_xact_lock($1, $2)', [1280653889, 2]);
+      const owner = await client.query(`SELECT id FROM projects WHERE id=$1 AND user_id=$2 AND trashed_at IS NULL${databaseConfigured ? ' FOR UPDATE' : ''}`, [project.id, req.user.id]);
+      if (!owner.rows?.[0]) {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        return res.status(404).json({ error: 'Projeto não encontrado ou já não está disponível.', code: 'PROJECT_NOT_FOUND', request_id: req.requestId || null });
+      }
+      const reservation = (await client.query('SELECT state FROM neon_provision_reservations WHERE project_id=$1', [project.id])).rows[0];
+      if (reservation && ['pending', 'cleanup_required'].includes(String(reservation.state))) {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        return res.status(409).json({ error: 'A criação de uma base Neon está em curso ou precisa de reconciliação; não alteres a ligação enquanto isso não estiver resolvido.', code: 'NEON_PROVISION_IN_PROGRESS', request_id: req.requestId || null });
+      }
+      const current = (await client.query('SELECT provider_project_id FROM project_database_connections WHERE project_id=$1', [project.id])).rows[0];
+      if (current?.provider_project_id) {
+        await client.query('ROLLBACK'); transactionStarted = false;
+        return res.status(409).json({ error: 'Este projecto já tem uma base Neon criada. Não vou substituir as credenciais da base existente por uma ligação manual.', code: 'PROJECT_DATABASE_EXISTS', request_id: req.requestId || null });
+      }
+      const { rows } = await client.query(`INSERT INTO project_database_connections(project_id,name,provider,hostname,port,database_name,username,password_cipher,provider_project_id,provider_branch_id,connection_uri_cipher,pooled_uri_cipher,region_id,pg_version)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'','','','','',16)
+        ON CONFLICT(project_id) DO UPDATE SET name=EXCLUDED.name,provider=EXCLUDED.provider,hostname=EXCLUDED.hostname,port=EXCLUDED.port,database_name=EXCLUDED.database_name,username=EXCLUDED.username,password_cipher=EXCLUDED.password_cipher,provider_project_id='',provider_branch_id='',connection_uri_cipher='',pooled_uri_cipher='',region_id='',pg_version=16,updated_at=NOW()
+        RETURNING id,name,provider,hostname,port,database_name,username`, [project.id,name,provider,hostname,port,databaseName,username,encrypted]);
+      await client.query('COMMIT'); transactionStarted = false;
+      res.json({ ok: true, connection: { ...rows[0], database: rows[0].database_name, has_password: true } });
+    } catch (error) {
+      if (transactionStarted) { try { await client.query('ROLLBACK'); } catch {} }
+      throw error;
+    } finally { client.release?.(); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível guardar a configuração da ligação.'); }
 });
 app.post('/api/projects/:id/database/connection/test', requireAuth, async (req, res) => {
   let client;
+  let project;
   try {
-    const project = await getProject(req.params.id, req.user.id);
+    project = await getProject(req.params.id, req.user.id);
     if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
+
+    // This operation can make the server open an outbound TCP connection. Apply a
+    // shared, database-backed limit before doing DNS resolution or connecting.
+    let rateLimit;
+    try {
+      rateLimit = await consumePostgresConnectionTestLimit(pool, {
+        projectId: project.id,
+        ip: String(getRequestClientIp(req)),
+        now: Date.now(),
+        perIpLimit: POSTGRES_CONNECTION_TEST_LIMITS.perIp,
+        perProjectLimit: POSTGRES_CONNECTION_TEST_LIMITS.perProject,
+        windowMs: POSTGRES_CONNECTION_TEST_LIMITS.windowMs
+      });
+    } catch (error) {
+      logEvent('error', 'postgres_connection_test_limiter_unavailable', {
+        request_id: req.requestId || null,
+        project_id: Number(project.id),
+        error_code: String(error?.code || 'unknown').slice(0, 40)
+      });
+      void sendOperationalAlert('postgres_connection_test_limiter_unavailable', { request_id: req.requestId || null });
+      return respondApiError(req, res, error, 'O serviço de teste de ligações está temporariamente indisponível.', 503);
+    }
+    if (!rateLimit.allowed) {
+      const retryAfter = Math.max(1, Math.ceil(rateLimit.retryAfterMs / 1000));
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: 'Atingiste o limite de testes de ligação PostgreSQL. Tenta novamente mais tarde.', retry_after_seconds: retryAfter });
+    }
+
     const { rows } = await pool.query('SELECT hostname,port,database_name,username,password_cipher,provider,connection_uri_cipher FROM project_database_connections WHERE project_id=$1', [project.id]);
     if (!rows[0]) return res.status(400).json({ error: 'Configura primeiro uma ligação PostgreSQL.' });
     const c = rows[0];
+    let target;
+    let credentials;
     if (c.provider === 'neon' && c.connection_uri_cipher) {
-      client = new Client({ connectionString: decryptSecret(c.connection_uri_cipher), connectionTimeoutMillis: 10000 });
+      // Do not pass a user-controllable URI to pg.Client. Parse it, resolve the
+      // hostname, reject special/private destinations and pin the socket to one
+      // validated public IP while preserving TLS hostname verification.
+      const uri = decryptSecret(c.connection_uri_cipher);
+      const details = parsePostgresUri(uri);
+      target = await resolvePublicPostgresTarget(details.hostname, details.port, { ports: POSTGRES_ALLOWED_PORTS });
+      const parsedUri = new URL(uri);
+      credentials = {
+        database: details.database,
+        user: details.username,
+        password: details.password,
+        enableChannelBinding: parsedUri.searchParams.get('channel_binding') === 'require'
+      };
     } else {
-      client = new Client({ host:c.hostname, port:Number(c.port), database:c.database_name, user:c.username, password:decryptSecret(c.password_cipher), ssl:{rejectUnauthorized:true}, connectionTimeoutMillis:7000 });
+      target = await resolvePublicPostgresTarget(c.hostname, Number(c.port), { ports: POSTGRES_ALLOWED_PORTS });
+      credentials = {
+        database: c.database_name,
+        user: c.username,
+        password: decryptSecret(c.password_cipher)
+      };
     }
-    await client.connect(); await client.query('SELECT 1');
+    client = new Client(buildPinnedPostgresClientConfig(target, credentials, { ports: POSTGRES_ALLOWED_PORTS }));
+    await client.connect();
+    await client.query('SELECT 1');
     res.json({ ok:true, message:'Ligação PostgreSQL testada com sucesso.' });
-  } catch (error) { res.status(400).json({ ok:false, error: `Não foi possível ligar à base de dados: ${String(error.message || 'erro de ligação').slice(0,220)}` }); }
-  finally { if (client) await client.end().catch(()=>{}); }
+  } catch (error) {
+    if (isPostgresTargetSecurityError(error)) {
+      logEvent('warn', 'postgres_connection_target_rejected', {
+        request_id: req.requestId || null,
+        project_id: project ? Number(project.id) : null,
+        reason: String(error.reason || 'target_rejected').slice(0, 48)
+      });
+      return res.status(400).json({ error: 'Destino PostgreSQL bloqueado por segurança. Usa um hostname público válido, sem endereços privados ou locais, e uma porta autorizada.' });
+    }
+    respondApiError(req, res, error, 'Não foi possível ligar à base de dados. Confirma os dados da ligação e tenta novamente.', 502);
+  } finally {
+    if (client) await client.end().catch(() => {});
+  }
 });
+
 app.get('/api/projects/:id/environment', requireAuth, async (req, res) => {
   try { const project=await getProject(req.params.id,req.user.id); if(!project)return res.status(404).json({error:'Projeto não encontrado.'});
     const groups=await pool.query('SELECT id,name,created_at,updated_at FROM project_env_groups WHERE project_id=$1 ORDER BY name',[project.id]);
@@ -1144,19 +2082,91 @@ app.get('/api/projects/:id/database', requireAuth, async (req, res) => {
         provisioned_at: db.provisioned_at || null, created_at: db.created_at, updated_at: db.updated_at
       }, tables
     });
-  } catch (error) { res.status(500).json({ error: error.message || 'Não foi possível carregar a base de dados.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível carregar a base de dados.'); }
 });
 
+
 app.post('/api/projects/:id/database/provision', requireAuth, async (req, res) => {
+  let reservationCreated = false;
+  let reservedProjectId = null;
   try {
     const project = await getProject(req.params.id, req.user.id);
-    if (!project) return res.status(404).json({ error: 'Projeto não encontrado.' });
-    const result = await createNeonProjectDatabase(project, req.body || {});
-    res.status(201).json({ ok: true, database: result.database, connection: result.connection });
+    if (!project) return res.status(404).json({ error: 'Projeto não encontrado.', code: 'PROJECT_NOT_FOUND', request_id: req.requestId || null });
+
+    let rateDecision;
+    try {
+      rateDecision = await consumeResourceCreationLimit(pool, {
+        action: 'neon-provision', userId: req.user.id, ip: getRequestClientIp(req),
+        perUserLimit: RESOURCE_QUOTAS.neonCreatePerUserPerHour,
+        perIpLimit: RESOURCE_QUOTAS.neonCreatePerIpPerHour,
+        windowMs: RESOURCE_QUOTAS.creationWindowMs
+      });
+    } catch (error) {
+      logEvent('error', 'neon_creation_limiter_unavailable', { request_id: req.requestId || null, error_code: String(error?.code || 'unknown').slice(0, 40) });
+      void sendOperationalAlert('neon_creation_limiter_unavailable', { request_id: req.requestId || null });
+      return respondApiError(req, res, error, 'O serviço de criação de bases está temporariamente indisponível.', 503);
+    }
+    if (!rateDecision.allowed) {
+      const retry = Math.max(1, Math.ceil(rateDecision.retryAfterMs / 1000));
+      res.setHeader('Retry-After', String(retry));
+      return res.status(429).json({ error: 'Atingiste o limite de criação de bases de dados. Tenta novamente mais tarde.', code: 'NEON_CREATION_RATE_LIMITED', retry_after_seconds: retry, request_id: req.requestId || null });
+    }
+
+    await reserveNeonProvisionSlot(pool, project, req.user.id, RESOURCE_QUOTAS, { databaseConfigured });
+    reservationCreated = true;
+    reservedProjectId = project.id;
+    let result;
+    try {
+      result = await createNeonProjectDatabase(project, req.body || {});
+    } catch (error) {
+      if (error?.neonCleanupRequired) {
+        // Mark the local reservation as retained before trying the DB update. If
+        // storage is unavailable, leave the pending row in place (fail-closed).
+        reservationCreated = false;
+        try {
+          await pool.query("UPDATE neon_provision_reservations SET state='cleanup_required',provider_project_id=$2,updated_at=NOW() WHERE project_id=$1", [project.id, String(error.neonProjectId || '')]);
+        } catch (reservationError) {
+          logEvent('error', 'neon_cleanup_reservation_update_failed', { request_id: req.requestId || null, project_id: Number(project.id), error_code: String(reservationError?.code || 'unknown').slice(0, 40) });
+          void sendOperationalAlert('neon_cleanup_reservation_update_failed', { project_id: Number(project.id) });
+        }
+      } else {
+        try { await pool.query("UPDATE neon_provision_reservations SET state='failed',updated_at=NOW() WHERE project_id=$1", [project.id]); }
+        catch (reservationError) { logEvent('warn', 'neon_failed_reservation_update_failed', { project_id: Number(project.id), error_code: String(reservationError?.code || 'unknown').slice(0, 40) }); }
+        // Failed rows are an audit trail and do not count against quota.
+        reservationCreated = false;
+      }
+      throw error;
+    }
+    // The provider resource and credentials are now persisted. If releasing the
+    // reservation fails, still report success and downgrade it to non-counting
+    // failed state where possible; an active database already exists.
+    try {
+      await pool.query("DELETE FROM neon_provision_reservations WHERE project_id=$1 AND state='pending'", [project.id]);
+    } catch (releaseError) {
+      logEvent('error', 'neon_success_reservation_release_failed', { request_id: req.requestId || null, project_id: Number(project.id), error_code: String(releaseError?.code || 'unknown').slice(0, 40) });
+      void sendOperationalAlert('neon_success_reservation_release_failed', { project_id: Number(project.id) });
+      try { await pool.query("UPDATE neon_provision_reservations SET state='failed',updated_at=NOW() WHERE project_id=$1 AND state='pending'", [project.id]); } catch {}
+    }
+    reservationCreated = false;
+    res.status(201).json({ ok: true, database: result.database, connection: result.connection, quota: {
+      neon_databases_per_user: RESOURCE_QUOTAS.neonDatabasesPerUser,
+      neon_account_project_limit: RESOURCE_QUOTAS.neonAccountProjectLimit
+    } });
   } catch (error) {
-    const message = error.message || 'Não foi possível criar a base de dados do projecto.';
-    const status = /NEON_API_KEY|DATABASE_URL|região|versão PostgreSQL|nome deve|já tem uma base/i.test(message) ? 400 : 502;
-    res.status(status).json({ error: message });
+    if (reservationCreated && reservedProjectId !== null) {
+      try { await pool.query("DELETE FROM neon_provision_reservations WHERE project_id=$1 AND state='pending'", [reservedProjectId]); }
+      catch (cleanupError) { logEvent('error', 'neon_reservation_release_failed', { request_id: req.requestId || null, project_id: Number(reservedProjectId), error_code: String(cleanupError?.code || 'unknown').slice(0, 40) }); }
+    }
+    const missingConfiguration = /NEON_API_KEY|DATABASE_URL/i.test(String(error?.message || ''));
+    const status = Number(error?.statusCode) || (missingConfiguration ? 503 : 502);
+    const publicMessage = missingConfiguration
+      ? 'O serviço de bases de dados não está devidamente configurado.'
+      : status === 429 || status === 409
+        ? String(error.message || 'O limite foi atingido.')
+        : status === 503
+          ? 'O serviço de criação de bases está temporariamente indisponível ou atingiu um limite.'
+          : 'Não foi possível criar a base de dados do projeto.';
+    respondApiError(req, res, error, publicMessage, status);
   }
 });
 
@@ -1167,7 +2177,7 @@ app.post('/api/projects/:id/database/tables', requireAuth, async (req, res) => {
   if (name.startsWith('__lzw_')) return res.status(400).json({ error: 'O nome da tabela utiliza um prefixo reservado.' });
   let columns;
   try { columns = normalizeColumns(req.body.columns); }
-  catch (error) { return res.status(400).json({ error: error.message }); }
+  catch (error) { return res.status(400).json({ error: 'As colunas fornecidas são inválidas. Revê os nomes e tipos e tenta novamente.', code: 'INVALID_COLUMNS', request_id: req.requestId || null }); }
   const store = await getProjectDataStore(project.id);
   const client = await pool.connect();
   let table;
@@ -1197,7 +2207,7 @@ app.post('/api/projects/:id/database/tables', requireAuth, async (req, res) => {
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
     if (error.code === '23505') return res.status(409).json({ error: 'Já existe uma tabela com esse nome.' });
-    res.status(400).json({ error: error.message || 'Não foi possível criar a tabela.' });
+    respondApiError(req, res, error, 'Não foi possível criar a tabela.', 500);
   } finally { client.release?.(); }
 });
 
@@ -1211,7 +2221,7 @@ app.patch('/api/projects/:id/database/tables/:tableId/public-access', requireAut
     const publicInsert = Boolean(req.body.public_insert);
     const { rows } = await pool.query('UPDATE database_tables SET public_read=$1,public_insert=$2,updated_at=NOW() WHERE id=$3 RETURNING *', [publicRead, publicInsert, table.id]);
     res.json({ table: rows[0] });
-  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível guardar as permissões públicas.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível guardar as permissões públicas.'); }
 });
 
 app.delete('/api/projects/:id/database/tables/:tableId', requireAuth, async (req, res) => {
@@ -1234,7 +2244,7 @@ app.delete('/api/projects/:id/database/tables/:tableId', requireAuth, async (req
     res.json({ ok: true });
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch {}
-    res.status(500).json({ error: error.message || 'Não foi possível eliminar a tabela.' });
+    respondApiError(req, res, error, 'Não foi possível eliminar a tabela.');
   } finally { client.release?.(); }
 });
 
@@ -1252,7 +2262,7 @@ app.get('/api/projects/:id/database/tables/:tableId/records', requireAuth, async
     }
     const { rows } = await pool.query('SELECT id,data,created_at,updated_at FROM database_records WHERE table_id=$1 ORDER BY created_at DESC LIMIT $2', [table.id, limit]);
     res.json({ table, records: rows });
-  } catch (error) { res.status(500).json({ error: error.message || 'Não foi possível carregar os registos.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível carregar os registos.'); }
 });
 
 app.post('/api/projects/:id/database/tables/:tableId/records', requireAuth, async (req, res) => {
@@ -1271,7 +2281,7 @@ app.post('/api/projects/:id/database/tables/:tableId/records', requireAuth, asyn
     const { rows } = await pool.query('INSERT INTO database_records(table_id,data) VALUES($1,$2::jsonb) RETURNING *', [table.id, JSON.stringify(data)]);
     await pool.query('UPDATE database_tables SET updated_at=NOW() WHERE id=$1', [table.id]);
     res.json({ record: rows[0] });
-  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível adicionar o registo.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível adicionar o registo.', 500); }
 });
 
 app.put('/api/projects/:id/database/tables/:tableId/records/:recordId', requireAuth, async (req, res) => {
@@ -1298,7 +2308,7 @@ app.put('/api/projects/:id/database/tables/:tableId/records/:recordId', requireA
     const { rows } = await pool.query('UPDATE database_records SET data=$1::jsonb,updated_at=NOW() WHERE id=$2 AND table_id=$3 RETURNING *', [JSON.stringify(data), req.params.recordId, table.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Registo não encontrado.' });
     res.json({ record: rows[0] });
-  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível atualizar o registo.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível atualizar o registo.', 500); }
 });
 
 app.delete('/api/projects/:id/database/tables/:tableId/records/:recordId', requireAuth, async (req, res) => {
@@ -1317,7 +2327,7 @@ app.delete('/api/projects/:id/database/tables/:tableId/records/:recordId', requi
     const { rows } = await pool.query('DELETE FROM database_records WHERE id=$1 AND table_id=$2 RETURNING id', [req.params.recordId, table.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Registo não encontrado.' });
     res.json({ ok: true });
-  } catch (error) { res.status(500).json({ error: error.message || 'Não foi possível eliminar o registo.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível eliminar o registo.'); }
 });
 
 app.get('/api/projects/:id/api-keys', requireAuth, async (req, res) => {
@@ -1343,22 +2353,57 @@ app.delete('/api/projects/:id/api-keys/:keyId', requireAuth, async (req, res) =>
   res.json({ ok: true });
 });
 
-const publicApiAttempts = new Map();
-function allowPublicApiRequest(req, res) {
+let publicApiRateLimitCleanupCounter = 0;
+const PUBLIC_API_RATE_LIMITS = Object.freeze({
+  perIp: boundedIntegerEnv('PUBLIC_API_RATE_LIMIT_PER_IP', 120, 1, 10000),
+  perKey: boundedIntegerEnv('PUBLIC_API_RATE_LIMIT_PER_KEY', 600, 1, 100000),
+  perProject: boundedIntegerEnv('PUBLIC_API_RATE_LIMIT_PER_PROJECT', 1200, 1, 200000),
+  windowMs: boundedIntegerEnv('PUBLIC_API_RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000)
+});
+const PRIVATE_API_RATE_LIMITS = Object.freeze({
+  perIp: boundedIntegerEnv('PRIVATE_API_RATE_LIMIT_PER_IP', 300, 1, 20000),
+  perKey: boundedIntegerEnv('PRIVATE_API_RATE_LIMIT_PER_KEY', 3000, 1, 200000),
+  perProject: boundedIntegerEnv('PRIVATE_API_RATE_LIMIT_PER_PROJECT', 6000, 1, 500000),
+  windowMs: boundedIntegerEnv('PRIVATE_API_RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000)
+});
+async function allowProjectApiRequest(req, res) {
   const keyId = Number(req.apiKey?.id || 0);
-  const ip = String(req.ip || 'unknown');
-  const now = Date.now();
-  const bucketKey = `${keyId}:${ip}`;
-  const item = publicApiAttempts.get(bucketKey) || { count: 0, reset: now + 60_000 };
-  if (now > item.reset) { item.count = 0; item.reset = now + 60_000; }
-  item.count += 1;
-  publicApiAttempts.set(bucketKey, item);
-  if (publicApiAttempts.size > 5000) {
-    for (const [key, value] of publicApiAttempts) if (now > value.reset) publicApiAttempts.delete(key);
+  const projectId = Number(req.apiProject?.id || req.apiKey?.project_id || 0);
+  const limits = req.apiKey?.key_type === 'publishable' ? PUBLIC_API_RATE_LIMITS : PRIVATE_API_RATE_LIMITS;
+  const ip = getRequestClientIp(req).slice(0, 100);
+  try {
+    const decision = await consumePublicApiRateLimit(pool, {
+      keyId,
+      projectId,
+      keyType: req.apiKey?.key_type,
+      ip,
+      now: Date.now(),
+      perIpLimit: limits.perIp,
+      perKeyLimit: limits.perKey,
+      perProjectLimit: limits.perProject,
+      windowMs: limits.windowMs
+    });
+    publicApiRateLimitCleanupCounter += 1;
+    if (publicApiRateLimitCleanupCounter % 100 === 0) {
+      void pruneExpiredApiRateLimits(pool, Date.now()).catch(error => {
+        logEvent('warn', 'public_api_rate_limit_cleanup_failed', { error_code: String(error?.code || 'unknown').slice(0, 40) });
+      });
+    }
+    if (!decision.allowed) {
+      const retryAfter = Math.max(1, Math.ceil(decision.retryAfterMs / 1000));
+      res.setHeader('Retry-After', String(retryAfter));
+      res.status(429).json({ error: 'Limite de pedidos da API atingido. Tenta novamente mais tarde.', code: 'RATE_LIMITED', rate_limit_scope: decision.scope, retry_after_seconds: retryAfter });
+      return false;
+    }
+    return true;
+  } catch (error) {
+    logEvent('error', 'project_api_rate_limiter_unavailable', { request_id: req.requestId || null, error_code: String(error?.code || 'unknown').slice(0, 40) });
+    void sendOperationalAlert('project_api_rate_limiter_unavailable', { request_id: req.requestId || null });
+    respondApiError(req, res, error, 'O limitador da API está temporariamente indisponível.', 503);
+    return false;
   }
-  if (item.count > 120) { res.status(429).json({ error: 'Limite de pedidos da chave pública atingido. Tenta novamente dentro de um minuto.' }); return false; }
-  return true;
 }
+
 async function requireProjectApiKey(req, res, next) {
   try {
     const project = await pool.query('SELECT * FROM projects WHERE slug=$1 AND trashed_at IS NULL', [req.params.slug]);
@@ -1368,9 +2413,12 @@ async function requireProjectApiKey(req, res, next) {
     const key = await pool.query('SELECT id,project_id,key_type FROM api_keys WHERE project_id=$1 AND token_hash=$2', [project.rows[0].id, hashToken(token)]);
     if (!key.rows[0]) return res.status(401).json({ error: 'API key inválida.' });
     req.apiKey = key.rows[0];
-    if (req.apiKey.key_type === 'publishable' && !allowPublicApiRequest(req, res)) return;
-    await pool.query('UPDATE api_keys SET last_used_at=NOW() WHERE id=$1', [req.apiKey.id]);
     req.apiProject = project.rows[0];
+    if (!(await allowProjectApiRequest(req, res))) return;
+    // last_used_at is useful for operators, but writing it for every API call
+    // creates avoidable write contention under load. Update at most once per 5m.
+    const lastUsedThreshold = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    await pool.query('UPDATE api_keys SET last_used_at=NOW() WHERE id=$1 AND (last_used_at IS NULL OR last_used_at < $2)', [req.apiKey.id, lastUsedThreshold]);
     next();
   } catch { res.status(500).json({ error: 'Erro ao validar a API key.' }); }
 }
@@ -1396,7 +2444,7 @@ app.get('/v1/:slug/:table', requireProjectApiKey, async (req, res) => {
     }
     const { rows } = await pool.query('SELECT id,data,created_at,updated_at FROM database_records WHERE table_id=$1 ORDER BY created_at DESC LIMIT $2', [table.id, limit]);
     res.json({ project: req.apiProject.slug, table: table.name, columns: parseColumnDefinitions(table.columns), records: rows });
-  } catch (error) { res.status(500).json({ error: error.message || 'Não foi possível consultar a API.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível consultar a API.'); }
 });
 app.post('/v1/:slug/:table', requireProjectApiKey, async (req, res) => {
   try {
@@ -1413,7 +2461,7 @@ app.post('/v1/:slug/:table', requireProjectApiKey, async (req, res) => {
     }
     const { rows } = await pool.query('INSERT INTO database_records(table_id,data) VALUES($1,$2::jsonb) RETURNING *', [table.id, JSON.stringify(data)]);
     res.status(201).json({ record: rows[0] });
-  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível criar o registo.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível criar o registo.', 500); }
 });
 app.put('/v1/:slug/:table/:recordId', requireProjectApiKey, async (req, res) => {
   try {
@@ -1438,7 +2486,7 @@ app.put('/v1/:slug/:table/:recordId', requireProjectApiKey, async (req, res) => 
     const { rows } = await pool.query('UPDATE database_records SET data=$1::jsonb,updated_at=NOW() WHERE id=$2 AND table_id=$3 RETURNING *', [JSON.stringify(data), req.params.recordId, table.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Registo não encontrado.' });
     res.json({ record: rows[0] });
-  } catch (error) { res.status(400).json({ error: error.message || 'Não foi possível actualizar o registo.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível atualizar o registo.', 500); }
 });
 app.delete('/v1/:slug/:table/:recordId', requireProjectApiKey, async (req, res) => {
   try {
@@ -1456,7 +2504,7 @@ app.delete('/v1/:slug/:table/:recordId', requireProjectApiKey, async (req, res) 
     const { rows } = await pool.query('DELETE FROM database_records WHERE id=$1 AND table_id=$2 RETURNING id', [req.params.recordId, table.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Registo não encontrado.' });
     res.json({ ok: true });
-  } catch (error) { res.status(500).json({ error: error.message || 'Não foi possível eliminar o registo.' }); }
+  } catch (error) { respondApiError(req, res, error, 'Não foi possível eliminar o registo.'); }
 });
 
 function contentType(filePath) {
@@ -1479,7 +2527,7 @@ async function servePublished(req, res) {
     const requested = Array.isArray(req.params.splat) ? req.params.splat.join('/') : String(req.params.splat || '');
     const requestedPath = cleanPath(requested || 'index.html') || 'index.html';
     if (isPrivatePublishedPath(requestedPath)) return res.status(404).send('Ficheiro não encontrado.');
-    const { rows } = await pool.query(`SELECT d.*,p.id AS project_id FROM deployments d JOIN projects p ON p.id=d.project_id WHERE p.slug=$1 AND p.trashed_at IS NULL AND d.status='LIVE' ORDER BY d.created_at DESC LIMIT 1`, [slug]);
+    const { rows } = await pool.query(`SELECT d.*,p.id AS project_id FROM deployments d JOIN projects p ON p.id=d.project_id WHERE p.slug=$1 AND p.trashed_at IS NULL AND d.status='LIVE' ORDER BY d.id DESC LIMIT 1`, [slug]);
     const deployment = rows[0];
     if (!deployment) return res.status(404).send('Site ainda não foi publicado.');
     const commitResult = await pool.query('SELECT snapshot FROM commits WHERE id=$1 AND project_id=$2', [deployment.commit_id, deployment.project_id]);
@@ -1507,7 +2555,7 @@ async function servePublished(req, res) {
 }
 app.get('/sites/:slug/__luza_env.js', async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT p.id AS project_id FROM projects p JOIN deployments d ON d.project_id=p.id WHERE p.slug=$1 AND p.trashed_at IS NULL AND d.status='LIVE' ORDER BY d.created_at DESC LIMIT 1", [req.params.slug]);
+    const { rows } = await pool.query("SELECT p.id AS project_id FROM projects p JOIN deployments d ON d.project_id=p.id WHERE p.slug=$1 AND p.trashed_at IS NULL AND d.status='LIVE' ORDER BY d.id DESC LIMIT 1", [req.params.slug]);
     if (!rows[0]) return res.status(404).type('text/plain').send('Site ainda não foi publicado.');
     const result = await pool.query('SELECT name,value_cipher FROM project_env_vars WHERE project_id=$1 AND is_secret=FALSE ORDER BY name', [rows[0].project_id]);
     // Filter defensively by name as well, covering any older record that was saved as public.
@@ -1521,6 +2569,26 @@ app.get('/sites/:slug', (req, res) => res.redirect(302, `/sites/${encodeURICompo
 app.get('/sites/:slug/', servePublished);
 app.get('/sites/:slug/*splat', servePublished);
 
+// Keep API failures consistently JSON-shaped and never return raw database/provider errors.
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'Rota API não encontrada.', code: 'NOT_FOUND', request_id: req.requestId || null });
+});
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  const candidate = Number(error?.status || error?.statusCode);
+  const status = Number.isInteger(candidate) && candidate >= 400 && candidate <= 499 ? candidate : 500;
+  const message = status === 400
+    ? 'Pedido inválido. Verifica o formato dos dados enviados.'
+    : status === 413
+      ? 'O pedido excede o tamanho permitido.'
+      : status === 415
+        ? 'Formato do pedido não suportado.'
+        : status >= 500
+          ? 'Ocorreu um erro interno. Tenta novamente mais tarde.'
+          : 'Não foi possível processar o pedido.';
+  return respondApiError(req, res, error, message, status);
+});
+
 // Netlify serves the public/ directory as static assets. The Function only handles
 // /api, /v1 and /sites rewrites, while local Node deployments keep serving the SPA here.
 if (!process.env.NETLIFY) {
@@ -1532,14 +2600,40 @@ export { app, initDb };
 
 const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === __filename;
 if (isMainModule) {
+  const startHttpServer = (message) => {
+    const httpServer = app.listen(PORT, '0.0.0.0', () => logEvent('info', 'server_listening', { port: PORT, database_configured: databaseConfigured, message }));
+    let shutdownStarted = false;
+    const shutdown = signal => {
+      if (shutdownStarted) return;
+      shutdownStarted = true;
+      logEvent('info', 'graceful_shutdown_started', { signal });
+      const forceTimer = setTimeout(() => {
+        logEvent('error', 'graceful_shutdown_timeout', { signal });
+        process.exit(1);
+      }, 10000);
+      forceTimer.unref();
+      httpServer.close(async () => {
+        const projectPools = [...projectDataPools.values()].map(entry => entry?.pool).filter(Boolean);
+        await Promise.allSettled(projectPools.map(projectPool => projectPool.end()));
+        try { await pool?.end?.(); } catch {}
+        clearTimeout(forceTimer);
+        logEvent('info', 'graceful_shutdown_complete', { signal });
+        process.exitCode = 0;
+      });
+    };
+    process.once('SIGTERM', () => shutdown('SIGTERM'));
+    process.once('SIGINT', () => shutdown('SIGINT'));
+    return httpServer;
+  };
+
   initDb().then(() => {
-    app.listen(PORT, '0.0.0.0', () => console.log(`LUZAWEB listening on ${PORT}`));
+    startHttpServer('ready');
   }).catch(error => {
-    console.error('Database init failed:', error.message);
-    if (databaseConfigured) {
-      console.error('O servidor não iniciou porque o PostgreSQL não respondeu. Verifica DATABASE_URL, SSL e disponibilidade da base.');
+    logEvent('error', 'database_init_failed', { error_code: String(error?.code || error?.name || 'unknown').slice(0, 40) });
+    if (databaseConfigured || process.env.NODE_ENV === 'production' || process.env.NETLIFY) {
+      logEvent('error', 'server_start_aborted', { reason: 'database_or_configuration_unavailable' });
       process.exit(1);
     }
-    app.listen(PORT, '0.0.0.0', () => console.log(`LUZAWEB listening on ${PORT} (database not configured)`));
+    startHttpServer('database_not_configured_local_development');
   });
 }

@@ -1,4 +1,5 @@
 import serverless from 'serverless-http';
+import { randomUUID } from 'node:crypto';
 import { app, initDb } from '../../server.js';
 
 const proxy = serverless(app, {
@@ -16,19 +17,34 @@ function normalizeRewritePath(event) {
 
 export const handler = async (event, context) => {
   try {
-    if (!initialization) initialization = initDb();
+    if (!initialization) {
+      const attempt = initDb();
+      // Clear the Function-level cache after failure too, otherwise this warm
+      // instance would return 503 forever even if the database recovers.
+      initialization = attempt.catch(error => {
+        initialization = undefined;
+        throw error;
+      });
+    }
     await initialization;
   } catch (error) {
-    console.error('LUZAWEB Netlify function could not initialize:', error?.message || error);
+    const requestId = randomUUID();
+    const errorCode = String(error?.code || error?.name || 'unknown').slice(0, 48);
+    // Keep diagnostics correlated without writing connection strings, provider
+    // messages or secret/configuration values into the function log.
+    console.error(JSON.stringify({ event: 'function_init_failed', request_id: requestId, error_code: errorCode }));
     return {
       statusCode: 503,
       headers: {
         'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store'
+        'cache-control': 'no-store',
+        'x-request-id': requestId
       },
       body: JSON.stringify({
         ok: false,
-        error: 'O backend do LUZAWEB não está configurado ou não consegue ligar à base de dados. Verifica DATABASE_URL e JWT_SECRET nas variáveis do Netlify.'
+        error: 'O backend está temporariamente indisponível. Tenta novamente mais tarde.',
+        code: 'SERVICE_UNAVAILABLE',
+        request_id: requestId
       })
     };
   }
